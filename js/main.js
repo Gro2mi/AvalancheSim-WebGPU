@@ -23,7 +23,7 @@ frictionCoefficientSlider.addEventListener('input', () => {
 const dragCoefficientSlider = document.getElementById('dragCoefficientSlider');
 const dragCoefficientValue = document.getElementById('dragCoefficientValue');
 
-demDropdown.addEventListener('change', (event) => {
+demDropdown.addEventListener('change', async (event) => {
     const selectedFile = event.target.value;
     document.cookie = `demDropdown=${selectedFile}; path=/; max-age=31536000`; // expires in 1 year
 
@@ -31,6 +31,7 @@ demDropdown.addEventListener('change', (event) => {
     fetchInputs().then(() => {
         plotDem(dem);
     })
+    await runAndPlot();
 });
 
 frictionModelDropdown.addEventListener('change', (event) => {
