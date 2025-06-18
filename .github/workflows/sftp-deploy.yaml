@@ -18,6 +18,7 @@ jobs:
       - name: Upload via SFTP
         run: |
           lftp -c "
+            set sftp:auto-confirm yes
             open -u ${{ secrets.SFTP_USERNAME }},${{ secrets.SFTP_PASSWORD }} sftp://${{ secrets.SFTP_HOST }}:${{ secrets.SFTP_PORT }};
             mirror -R ./ ${{ secrets.SFTP_REMOTE_DIR }} --delete --verbose \
             --exclude-glob .git/ \
