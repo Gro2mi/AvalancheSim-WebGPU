@@ -260,18 +260,18 @@ function plotOutput() {
         buttons: [
             {
                 method: 'restyle',
+                args: ['x', [travelDistance]],
+                label: 'Travel Distance [m]'
+            },
+            {
+                method: 'restyle',
                 args: ['x', [time]],
                 label: 'Time [s]'
             },
             {
                 method: 'restyle',
-                args: ['x', [travelDistance]],
-                label: 'Distance [m]'
-            },
-            {
-                method: 'restyle',
                 args: ['x', [Array.from({ length: n }, (_, i) => i)]],
-                label: 'Index'
+                label: 'Timestep [#]'
             }
         ],
         direction: 'up',

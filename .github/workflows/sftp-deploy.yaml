@@ -1,0 +1,23 @@
+name: Upload to server via SFTP
+
+on:
+  push:
+    branches: [ main ]  # Change to your deployment branch
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install lftp
+        run: sudo apt-get install -y lftp
+
+      - name: Upload via SFTP
+        run: |
+          lftp -c "
+            open -u ${{ secrets.SFTP_USERNAME }},${{ secrets.SFTP_PASSWORD }} sftp://${{ secrets.SFTP_HOST }}:${{ secrets.SFTP_PORT }};
+            mirror -R ./ ${{ secrets.SFTP_REMOTE_DIR }} --delete --verbose
+          "
