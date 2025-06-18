@@ -50,8 +50,8 @@ function changeFrictionModel() {
         dragCoefficientSlider.disabled = false;
     }
 }
-
-document.getElementById('runSimulation').addEventListener('click', async () => {
+const runButton = document.getElementById('runSimulation')
+runButton.addEventListener('click', async () => {
     await runAndPlot();
 });
 
@@ -123,11 +123,21 @@ async function main() {
     if (!navigator.gpu) {
         console.error("WebGPU not supported");
         alert("WebGPU not supported. Please use a compatible browser like Chrome.");
-        return;
+        runButton.disabled = true;
+        runButton.textContent = "WebGPU not supported";
     }
-    const adapter = await navigator.gpu.requestAdapter();
-    if (!adapter.features.has("float32-filterable")) {
-        alert("Your device has to support float32-filterable textures to run this.");
+    try{
+        const adapter = await navigator.gpu.requestAdapter();
+        if (!adapter.features.has("float32-filterable")) {
+            alert("Your device has to support float32-filterable textures to run this.");
+            runButton.disabled = true;
+        runButton.textContent = "WebGPU not supported";
+        }
+    } catch (error) {
+        console.error("WebGPU not supported.", error);
+        alert("WebGPU not supported. Please use a compatible browser like Chrome.");
+        runButton.disabled = true;
+        runButton.textContent = "WebGPU not supported";
     }
     changeFrictionModel();
     // await getSettings();
