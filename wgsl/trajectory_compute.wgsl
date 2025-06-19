@@ -1,3 +1,11 @@
+
+struct Boundary {
+    x_min: f32,
+    y_min: f32,
+    x_max: f32,
+    y_max: f32,
+}
+
 struct Settings {
   num_steps: u32,
   model_type: u32,
@@ -10,62 +18,49 @@ struct Settings {
   boundary: Boundary,
 };
 
-struct Boundary {
-    x_min: f32,
-    y_min: f32,
-    x_max: f32,
-    y_max: f32,
-}
 
-struct Point3 {
+struct Point2 {
   x: f32,
   y: f32,
-  z: f32,
-  elevation_threshold: f32,
 };
 
-struct StepCount {
-  value: u32,
+struct SimInfo {
+  step_count: u32,
+  dxy_min: f32,
 };
 
-// this could be optimized with single values for vec3f.xyz as they are always 16 bytes wide
-// right now: 3*16 + 2*4 = 56 bytes needs to be 16 byte aligned -> 64, could be 48 bytes
-struct OutputData {
-    velocity: vec3f,                // 12 bytes + 4 bytes padding
-    timestep: f32,                  // 4 bytes
-    acceleration_tangential: vec3f, // 12 bytes + 4 bytes padding
-    acceleration_friction_magnitude: f32,     // 4 bytes
-    position: vec3f,                // 12 bytes + 4 bytes padding  // 4 bytes
-    elevation: f32,              // 4 bytes
-    normal: vec3f,
-    // + 8 bytes padding to 64 bytes
+struct TimestepData {
+    velocity: vec3f,                        // 12 bytes     12
+    dt: f32,                          //  4 bytes     16
+    acceleration_tangential: vec3f,         // 12 bytes     28
+    acceleration_friction_magnitude: f32,   //  4 bytes     32
+    position: vec3f,                        // 12 bytes     44
+    elevation: f32,                         //  4 bytes     48
+    normal: vec3f,                          // 12 bytes     60
+    acceleration_normal: vec3f,             // 12 bytes     76
+    // padding                                  4 bytes     80
+    uv: vec2f,                              //  8 bytes     88
+                                    // padding  8 bytes     96
 };
 
-@group(0) @binding(0)
-var<uniform> settings: Settings;
-@group(0) @binding(1)
-var<uniform> input_point: Point3;
-@group(0) @binding(2)
-var dem_texture: texture_2d<f32>;
-@group(0) @binding(3)
-var tex_sampler: sampler;
-@group(0) @binding(7)
-var normals_texture: texture_2d<f32>;
+@group(0) @binding(0) var<uniform> settings: Settings;
+@group(0) @binding(1) var<uniform> input_point: Point2;
+@group(0) @binding(2) var dem_texture: texture_2d<f32>;
+@group(0) @binding(3) var tex_sampler: sampler;
+@group(0) @binding(7) var normals_texture: texture_2d<f32>;
 
-@group(0) @binding(4)
-var<storage, read_write> steps_count: StepCount;
-@group(0) @binding(5)
-var<storage, read_write> out_buffer: array<OutputData>;
-@group(0) @binding(6)
-var<storage, read_write> out_debug: array<f32>;
+@group(0) @binding(4) var<storage, read_write> sim_info: SimInfo;
+@group(0) @binding(5) var<storage, read_write> out_buffer: array<TimestepData>;
+@group(0) @binding(6) var<storage, read_write> out_debug: array<f32>;
 
 const g: f32 = 9.81;
 const density: f32 = 200.0;
 const slab_thickness: f32 = 1.0;
-const velocity_threshold: f32 = 0.01f;
+const velocity_threshold: f32 = 1e-6f;
 
 const mass_per_area = density * slab_thickness;
 const acceleration_gravity = vec3f(0.0, 0.0, -g);
+
 
 fn get_starting_point_uv(id: vec3<u32>) -> vec2f {
     let input_texture_size = textureDimensions(dem_texture);
@@ -79,83 +74,86 @@ fn get_starting_point_uv(id: vec3<u32>) -> vec2f {
 @compute @workgroup_size(1)
 fn main() {
     let domain_size = vec2f(settings.boundary.x_max - settings.boundary.x_min, settings.boundary.y_max - settings.boundary.y_min);
-    let dxy = vec2f(domain_size) / vec2f(textureDimensions(dem_texture));
+    let dxy = domain_size / vec2f(textureDimensions(dem_texture));
+    let elevation_threshold = min_elevation();
     let dxy_min = min(dxy.x, dxy.y);
-    let bounds_min = vec2f(settings.boundary.x_min, settings.boundary.y_min);
-    let bounds_max = vec2f(settings.boundary.x_max, settings.boundary.y_max);
-    let cfl: f32 = settings.cfl;
-    steps_count.value = settings.num_steps;
-//   // Loop inside shader, one invocation only
-    var uv = world_to_uv(vec2f(input_point.x, input_point.y), bounds_min, bounds_max, dxy);
-    var normal = get_normal(uv);
+    sim_info.dxy_min = dxy_min;
+    var last: TimestepData;
+    sim_info.step_count = settings.num_steps;
+    last.uv = world_to_uv(vec2f(input_point.x, input_point.y));
 
-    var position = vec3f(input_point.x, input_point.y, get_elevation(uv));
-    var velocity = vec3<f32>(0f, 0f, 0f);
+    // webigeo copy part,
+    // uncomment steps_count.value
+    last.elevation = get_elevation(last.uv);
+    last.normal = get_normal(last.uv);
+    last.position = vec3f(input_point.x, input_point.y, last.elevation);
+    last.velocity = vec3f(0f, 0f, 0f);
 //     var last_velocity = vec3<f32>(0f, 0f, 0f);
-    var acceleration_tangential = acceleration_gravity + g * normal.z * normal;
-    var acceleration_friction_magnitude = 0f;
-    var elevation = get_elevation(uv);
+    last.acceleration_tangential = acceleration_gravity + g * last.normal.z * last.normal;
+    last.acceleration_friction_magnitude = 0f;
     // estimation of the first timestep to calculate actual timestep, safety factor of 1.1 needs to be
     // bigger than 1.0 because it's in the divisor later
-    var dt: f32 = sqrt(cfl * dxy_min / length(acceleration_tangential)) * 1.1;
-    update_output_data(0u, dt, position, velocity, acceleration_tangential, acceleration_friction_magnitude, elevation, normal);
+    last.dt = sqrt(settings.cfl * dxy_min / length(last.acceleration_tangential)) * 1.1;
+    update_output_data(0u, last);
 
     for (var i: u32 = 0u; i < settings.num_steps; i++) {
+        let current: TimestepData = compute_timestep(last, dxy_min);
+        update_output_data(i + 1u, current);
         // TODO more sophisticated projection methods
-        position.z = elevation;
-        normal = get_normal(uv); 
-        let acceleration_normal = g * normal.z * normal;
-        acceleration_tangential = acceleration_gravity + acceleration_normal;
-        var factor = 1.0;
-        let velocity_magnitude = length(velocity);
-        dt = factor * cfl * dxy_min / length(velocity + acceleration_tangential * dt);
-        dt = min(dt, 0.5);
-        acceleration_friction_magnitude = acceleration_by_friction(acceleration_normal, mass_per_area, velocity);
-        velocity = velocity + acceleration_tangential * dt;
-        // friction stop condition
-        if(length(velocity) < acceleration_friction_magnitude * dt){
-            dt = length(velocity) / acceleration_friction_magnitude;
-        }
-        velocity = velocity - acceleration_friction_magnitude * normalize(velocity) * dt;
-        let relative_trajectory = velocity * dt;
-        position = position + relative_trajectory;
-        uv = world_to_uv(vec2f(position.x, position.y), bounds_min, bounds_max, dxy);
-        elevation = get_elevation(uv);
-        update_output_data(i + 1u, dt, position, velocity, acceleration_tangential, acceleration_friction_magnitude, elevation, normal);
-    
-        if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0 
-            || elevation < input_point.elevation_threshold - .9
-            || length(velocity) < 0.0001
-        ) {
-            steps_count.value = i + 2u;
+        last = current;
+        last.position.z = last.elevation;
+
+        // stop criterion friction
+        if (length(current.velocity) < 0.0001) {
+            sim_info.step_count = i + 2u;
             break;
         }
+        // out of bounds or non rectangular terrain
+        if(current.uv.x < 0.0 || current.uv.x > 1.0 || current.uv.y < 0.0 || current.uv.y > 1.0 
+            || last.elevation < elevation_threshold){
+            sim_info.step_count = i;
+            break;
         }
-    out_debug[0] = position.x;
-    out_debug[1] = position.y;
-    out_debug[2] = uv.x;
-    out_debug[3] = uv.y;
-    out_debug[5] = get_elevation(uv);
-    out_debug[6] = input_point.elevation_threshold;
+        
+    }
+    out_debug[0] = last.position.x;
+    out_debug[1] = last.position.y;
+    out_debug[2] = last.uv.x;
+    out_debug[3] = last.uv.y;
+    out_debug[4] = get_elevation(last.uv);
+    out_debug[5] = elevation_threshold;
+    out_debug[7] = settings.boundary.x_min;
+    out_debug[8] = settings.boundary.y_min;
+    out_debug[9] = settings.boundary.x_max;
+    out_debug[10] = settings.boundary.y_max;
+
 }
 
-fn update_output_data(
-    i: u32,
-    dt: f32,
-    position: vec3f,
-    velocity: vec3f,
-    acceleration_tangential: vec3f,
-    acceleration_friction_magnitude: f32,
-    elevation: f32,
-    normal: vec3f
-) {
-    out_buffer[i].velocity = velocity;
-    out_buffer[i].acceleration_tangential = acceleration_tangential;
-    out_buffer[i].timestep = dt;
-    out_buffer[i].acceleration_friction_magnitude = acceleration_friction_magnitude;
-    out_buffer[i].position = position;
-    out_buffer[i].elevation = elevation;
-    out_buffer[i].normal = normal;
+fn compute_timestep(last: TimestepData, dxy_min: f32) -> TimestepData {
+        var current: TimestepData;
+        current.normal = get_normal(last.uv); 
+        current.acceleration_normal = g * current.normal.z * current.normal;
+        current.acceleration_tangential = acceleration_gravity + current.acceleration_normal;
+        // avoid division by zero with velocity_threshold
+        current.dt = settings.cfl * dxy_min / (length(last.velocity + current.acceleration_tangential * last.dt) + velocity_threshold);
+        
+        current.dt = min(current.dt, 0.8);
+        current.acceleration_friction_magnitude = acceleration_by_friction(current.acceleration_normal, mass_per_area, last.velocity);
+        current.velocity = last.velocity + current.acceleration_tangential * current.dt;
+        // friction stop condition
+        if(length(current.velocity) < current.acceleration_friction_magnitude * current.dt){
+            current.dt = length(current.velocity) / current.acceleration_friction_magnitude;
+        }
+        current.velocity = current.velocity - current.acceleration_friction_magnitude * normalize(current.velocity) * current.dt;
+        let relative_trajectory = current.velocity * current.dt;
+        current.position = last.position + relative_trajectory;
+        current.uv = world_to_uv(vec2f(current.position.x, current.position.y));
+        current.elevation = get_elevation(current.uv);
+        return current;
+}
+
+fn update_output_data(i: u32, timestep_data: TimestepData) {
+    out_buffer[i] = timestep_data;
 }
 
 fn acceleration_by_friction(acceleration_normal: vec3f, mass_per_area: f32, velocity: vec3f) -> f32 {
@@ -185,7 +183,7 @@ fn acceleration_by_friction(acceleration_normal: vec3f, mass_per_area: f32, velo
     }
     // samosAT friction model
     else if (model == 3){
-        let min_shear_stress = 0f;
+        let min_shear_stress_samosat = 0f;
         let rs0 = 0.222;
         let kappa = 0.43;
         let r = 0.05;
@@ -196,7 +194,7 @@ fn acceleration_by_friction(acceleration_normal: vec3f, mass_per_area: f32, velo
             div = 1.0;
         }
         div = log(div) / kappa + b;
-        shear_stress = min_shear_stress + normal_stress * friction_coefficient * (1.0 + rs0 / (rs0 + rs)) + density * velocity_magnitude * velocity_magnitude / (div * div);
+        shear_stress = min_shear_stress_samosat + normal_stress * friction_coefficient * (1.0 + rs0 / (rs0 + rs)) + density * velocity_magnitude * velocity_magnitude / (div * div);
     }
     let acceleration_magnitude = shear_stress / mass_per_area;
     return acceleration_magnitude;
@@ -210,15 +208,38 @@ fn get_elevation(uv: vec2f) -> f32 {
 }
 
 fn get_normal(uv: vec2f) -> vec3f {
-    var normal = textureSampleLevel(normals_texture, tex_sampler, uv, 0).xyz * 2 - 1; // convert from [0, 1] to [-0.5, 0.5]
+    var normal = textureSampleLevel(normals_texture, tex_sampler, uv, 0).xyz * 2 - 1; // convert from [0, 1] to [-1, 1]
     normal.y = -normal.y; // flip y-axis to match the coordinate system
     return normal;
 }
 
-fn world_to_uv(world_pos: vec2f, bounds_min: vec2f, bounds_max: vec2f, dxy: vec2f) -> vec2f {
-    return (world_pos - bounds_min) / (bounds_max - bounds_min + dxy);
+fn world_to_uv(world_pos: vec2f) -> vec2f {
+    let bounds_min = vec2f(settings.boundary.x_min, settings.boundary.y_min);
+    let bounds_max = vec2f(settings.boundary.x_max, settings.boundary.y_max);
+    return (world_pos - bounds_min) / (bounds_max - bounds_min + vec2f(sim_info.dxy_min, sim_info.dxy_min));
 }
 
-fn uv_to_world(uv: vec2f, bounds_min: vec2f, bounds_max: vec2f) -> vec2f {
+fn uv_to_world(uv: vec2f) -> vec2f {
+    let bounds_min = vec2f(settings.boundary.x_min, settings.boundary.y_min);
+    let bounds_max = vec2f(settings.boundary.x_max, settings.boundary.y_max);
     return mix(bounds_min, bounds_max, uv);
+}
+
+const MIN_VALID_ELEVATION: f32 = 0.9; // Elevations <= this are considered invalid (e.g., nodata or background)
+
+fn min_elevation() -> f32 {
+    // find the minimum elevation in the height texture
+    let tex_size = textureDimensions(dem_texture);
+    var min_val: f32 = 1e10;
+
+    for (var y: u32 = 0; y < tex_size.y; y++) {
+        for (var x: u32 = 0; x < tex_size.x; x++) {
+            let value = textureLoad(dem_texture, vec2u(x, y), 0).x;
+            // Only consider values above the minimum valid elevation threshold
+            if (value < min_val && value > MIN_VALID_ELEVATION) {
+                min_val = value;
+            }
+        }
+    }
+    return min_val - 0.1;
 }

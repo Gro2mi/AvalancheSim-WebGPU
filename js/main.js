@@ -1,4 +1,3 @@
-var casename;
 
 const demDropdown = document.getElementById('demDropdown');
 const frictionModelDropdown = document.getElementById('frictionModelDropdown');
@@ -84,8 +83,8 @@ window.addEventListener('DOMContentLoaded', () => {
     }
 });
 
-function getSettings() {
-    settings.set(
+async function getSettings() {
+    await settings.set(
         casename = demDropdown.value,
         maxSteps = parseInt(stepSlider.value),
         simModel = 0,
@@ -105,9 +104,7 @@ async function loadReleasePoints(casename) {
 }
 
 async function fetchInputs() {
-    getSettings();
-    aabb = await fetchBounds(demDropdown.value);
-    console.log("Returned AABB buffer:", aabb);
+    await getSettings();
     dem = await loadPNGAsFloat32(settings.casename);
     release_points = await loadReleasePoints(settings.casename);
     release_point = release_points.centroids[0]
@@ -115,7 +112,7 @@ async function fetchInputs() {
     y = linspace(settings.bounds.ymin, settings.bounds.ymax, dem.height);
     return true;
 }
-var settings = new Settings();
+var settings = new SimSettings();
 var release_points;
 var release_point;
 // fetchAabb(demDropdown.value);
@@ -126,12 +123,12 @@ async function main() {
         runButton.disabled = true;
         runButton.textContent = "WebGPU not supported";
     }
-    try{
-        const adapter = await navigator.gpu.requestAdapter();
+    try {
+        adapter = await navigator.gpu.requestAdapter();
         if (!adapter.features.has("float32-filterable")) {
             alert("Your device has to support float32-filterable textures to run this.");
             runButton.disabled = true;
-        runButton.textContent = "WebGPU not supported";
+            runButton.textContent = "WebGPU not supported";
         }
     } catch (error) {
         console.error("WebGPU not supported.", error);
@@ -145,6 +142,9 @@ async function main() {
     plotDem(dem); // Initial plot
     // await computeNormalsFromDemTexture(settings, dem);
     console.log("Release point:", release_point);
+    device = await adapter.requestDevice({
+        requiredFeatures: ["float32-filterable"],
+    });
     await run(settings, dem, release_point);
     plotOutput();
     plotPosition();
