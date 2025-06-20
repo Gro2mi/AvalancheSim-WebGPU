@@ -25,12 +25,12 @@ async function run(settings, dem, release_point) {
   ])
   
   const shaderCode = await fetch('wgsl/trajectory_compute.wgsl').then(r => r.text());
-  timer.checkpoint("shader fetching");
+  simTimer.checkpoint("shader fetching");
 
   const normalsModule = await checkWGSL(device, shaderNormals);
   const releasePointsModule = await checkWGSL(device, shaderReleasePoints);
   const trajectoryModule = await checkWGSL(device, shaderCode);
-  timer.checkpoint("shader compilation");
+  simTimer.checkpoint("shader compilation");
   
   const boundsData = new Float32Array([
     settings.bounds.xmin, settings.bounds.ymin,
