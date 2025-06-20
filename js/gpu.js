@@ -1,8 +1,9 @@
 var simData, releasePoints;
 var device;
+var simTimer = new Timer("Avalanche Simulation");
 
 async function run(settings, dem, release_point) {
-  const timer = new Timer("Avalanche Simulation");
+  simTimer = new Timer("Avalanche Simulation")
 
   // wgsl doesn't support imports
   const shaderNormals = await loadAndConcatShaders([
@@ -218,11 +219,11 @@ async function run(settings, dem, release_point) {
       depthOrArrayLayers: 1,
     }
   );
-  timer.checkpoint("preparation");
+  simTimer.checkpoint("preparation");
   // Submit commands
   device.queue.submit([commandEncoder.finish()]);
   await device.queue.onSubmittedWorkDone();
-  timer.checkpoint("shader execution");
+  simTimer.checkpoint("shader execution");
 
   // Map and read data helper
   async function readBuffer(buffer, size, ctor) {
@@ -250,7 +251,7 @@ async function run(settings, dem, release_point) {
     line += `${i} ${desc}: ${bufferDebug[i].toFixed(2)}, `;
   }
   console.log("Debug info: ", line);
-  timer.checkpoint("readback buffer");
+  simTimer.checkpoint("readback buffer");
 
   await readReleasePointsBuffer.mapAsync(GPUMapMode.READ);
   const mapped = new Uint8Array(readReleasePointsBuffer.getMappedRange());
@@ -264,13 +265,13 @@ async function run(settings, dem, release_point) {
   }
   readReleasePointsBuffer.unmap();
   
-  timer.checkpoint("readback textures");
+  simTimer.checkpoint("readback textures");
   simData = new SimData(simInfo.dxyMin);
   simData.parse(bufferSimData, simInfo.stepCount);
 
   console.log([...bufferSimData.slice(0, 16)]); // Log first 16 floats for debugging
-  timer.checkpoint("parse output buffer");
-  timer.printSummary();
+  simTimer.checkpoint("parse output buffer");
+  simTimer.printSummary();
   exportReleasePointsToPNG(releasePoints, dem.width, dem.height, "releaseCanvas");
 
 }

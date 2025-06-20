@@ -1,4 +1,3 @@
-
 async function plotDem(dem) {
     try {
         const dem2d = to2DFloatArray(dem.arr1d, dem.width, dem.height).map(typedArr => Array.from(typedArr));
@@ -8,20 +7,22 @@ async function plotDem(dem) {
             y: y,
             z: [...z],
             type: 'surface',
-            colorscale: 'Greys',
+            colorscale: 'Earth',
             cmin: 0,
-            cmax: 4000,
-            // reversescale: true,
-
+            cmax: 3000,
             lighting: {
-                flat: true
+                ambient: 0.1,      // less ambient = darker shadows
+                diffuse: 0.4,      // more diffuse = softer shadows
+                specular: 1.0,     // strong highlights
+                roughness: 0.7,    // lower = shinier
+                fresnel: 0.0       // optional for reflectivity
             },
             contours: {
                 z: {
                     show: true,
                     start: 0,
                     end: 4000,
-                    size: 200,                 // Contours at 0, 200, 400, ..., 4000
+                    size: 100,                 // Contours at 0, 100, 200, ..., 4000
                     color: 'white',
                     project: { z: false }
                 },
@@ -109,9 +110,9 @@ function plotPosition() {
         marker: {
             size: 3,
             color: simData.velocityMagnitude,
-            colorscale: 'Viridis', 
-            cmin: Math.min(...simData.velocityMagnitude), 
-            cmax: Math.max(...simData.velocityMagnitude),  
+            colorscale: 'Hot',
+            cmin: Math.min(...simData.velocityMagnitude),
+            cmax: Math.max(...simData.velocityMagnitude),
         },
         name: 'Trajectory'
     };
@@ -161,8 +162,8 @@ function plotOutput() {
         type: 'scatter',
         mode: 'lines',
         // first element is zero due to velocity being zero at the start
-        x: x.slice(1, n-2),
-        y: simData.cfl.slice(1, n-2),
+        x: x.slice(1, n - 2),
+        y: simData.cfl.slice(1, n - 2),
         name: 'CFL',
         visible: 'legendonly',
     };
@@ -307,12 +308,12 @@ function plotOutput() {
 
         // Attach listener to save visibility changes
         if (!outputPlot._restyleListenerAdded) {
-        outputPlot.on('plotly_restyle', () => {
-            const visibility = outputPlot.data.map(trace => trace.visible ?? true);
-            localStorage.setItem('traceVisibility', JSON.stringify(visibility));
-            outputPlot._restyleListenerAdded = true;
-        });
-    }
+            outputPlot.on('plotly_restyle', () => {
+                const visibility = outputPlot.data.map(trace => trace.visible ?? true);
+                localStorage.setItem('traceVisibility', JSON.stringify(visibility));
+                outputPlot._restyleListenerAdded = true;
+            });
+        }
     });
 }
 const outputPlot = document.getElementById('outputPlot');
@@ -335,30 +336,61 @@ function restoreTraceVisibility(plotElement, traces) {
 }
 
 function plotReleasePointsRGBA(releasePoints, width, height) {
-  const slabMap = [];
+    const slabMap = [];
 
-  for (let y = 0; y < height; y++) {
-    const row = [];
-    for (let x = 0; x < width; x++) {
-      const idx = (y * width + x) * 4;
-      const alpha = releasePoints[idx + 3]; // A channel
-      row.push(alpha / 255); // Normalize to 0–1 if needed
+    for (let y = 0; y < height; y++) {
+        const row = [];
+        for (let x = 0; x < width; x++) {
+            const idx = (y * width + x) * 4;
+            const alpha = releasePoints[idx + 3]; // A channel
+            row.push(alpha / 255); // Normalize to 0–1 if needed
+        }
+        slabMap.push(row);
     }
-    slabMap.push(row);
-  }
 
-  const data = [{
-    z: slabMap,
-    type: 'heatmap',
-    colorscale: 'Viridis', // or 'Jet', 'Greys', etc.
-    colorbar: { title: 'Slab thickness (norm)' }
-  }];
+    const data = [{
+        z: slabMap,
+        type: 'heatmap',
+        colorscale: 'Viridis', // or 'Jet', 'Greys', etc.
+        colorbar: { title: 'Slab thickness (norm)' }
+    }];
 
-  const layout = {
-    title: 'Release Points (Slab Thickness)',
-    xaxis: { title: 'X' },
-    yaxis: { title: 'Y', autorange: 'reversed' }, // flip vertically for image-like view
-  };
+    const layout = {
+        title: 'Release Points (Slab Thickness)',
+        xaxis: { title: 'X' },
+        yaxis: { title: 'Y', autorange: 'reversed' }, // flip vertically for image-like view
+    };
 
-  Plotly.newPlot('releasePointsPlot', data, layout);
+    Plotly.newPlot('releasePointsPlot', data, layout);
+}
+
+function plotTimer() {
+    // const x = ['Load Data', 'Process Data', 'Render UI', 'Finish'];
+    //   const y = [12.34, 18.22, 7.89, 4.56]; // delta times in ms
+    const checkpoints = simTimer.getCheckpoints();
+
+    const x = checkpoints.map(cp => cp.name);
+    const y = checkpoints.map(cp => parseFloat(cp.delta));
+    const data = [{
+        type: "waterfall",
+        x: x,
+        y: y,
+        textposition: "outside",
+        text: y.map(v => v.toFixed(2) + " ms"),
+        connector: {
+            line: {
+                color: "rgb(63, 63, 63)"
+            }
+        }
+    }];
+
+    const layout = {
+        title: "Timer Checkpoints Waterfall",
+        yaxis: {
+            title: "Milliseconds",
+            zeroline: false
+        }
+    };
+
+    Plotly.newPlot("timerPlot", data, layout);
 }
