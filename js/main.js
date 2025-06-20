@@ -21,12 +21,13 @@ frictionCoefficientSlider.addEventListener('input', () => {
 });
 const dragCoefficientSlider = document.getElementById('dragCoefficientSlider');
 const dragCoefficientValue = document.getElementById('dragCoefficientValue');
+dragCoefficientSlider.addEventListener('input', () => {
+    dragCoefficientValue.textContent = dragCoefficientSlider.value;
+});
 
 demDropdown.addEventListener('change', async (event) => {
     const selectedFile = event.target.value;
-    document.cookie = `demDropdown=${selectedFile}; path=/; max-age=31536000`; // expires in 1 year
-
-    // fetchAndPlotDem(selectedFile);
+    localStorage.setItem('demDropdown', selectedFile);
     fetchInputs().then(() => {
         plotDem(dem);
     })
@@ -42,10 +43,13 @@ function changeFrictionModel() {
     if (selectedModel == 'Coulomb') {
         frictionCoefficientSlider.value = 0.4663;
         frictionCoefficientValue.textContent = frictionCoefficientSlider.value;
-        dragCoefficientSlider.disabled = true;
     } else {
         frictionCoefficientSlider.value = 0.155;
         frictionCoefficientValue.textContent = frictionCoefficientSlider.value;
+    }
+    if (selectedModel == 'Coulomb' || selectedModel == 'samosAT') {
+        dragCoefficientSlider.disabled = true;
+    } else {
         dragCoefficientSlider.disabled = false;
     }
 }
@@ -60,6 +64,7 @@ async function runAndPlot() {
     await run(settings, dem, release_point);
     plotOutput();
     plotPosition();
+    plotTimer();
 }
 
 document.addEventListener('keydown', async function (event) {
@@ -75,11 +80,9 @@ document.addEventListener('keydown', async function (event) {
 });
 
 window.addEventListener('DOMContentLoaded', () => {
-    const cookies = document.cookie.split(';').map(c => c.trim());
-    const cookieObj = Object.fromEntries(cookies.map(c => c.split('=')));
-
-    if (cookieObj.demDropdown) {
-        demDropdown.value = cookieObj.demDropdown;
+    const savedFile = localStorage.getItem('demDropdown');
+    if (savedFile) {
+        demDropdown.value = savedFile;
     }
 });
 
@@ -92,7 +95,7 @@ async function getSettings() {
         density = 200,
         slabThickness = 1,
         frictionCoefficient = frictionCoefficientSlider.value,
-        dragCoefficient = 4000.0,
+        dragCoefficient = dragCoefficientSlider.value,
         cfl = parseFloat(cflSlider.value),
     )
 }
@@ -148,6 +151,7 @@ async function main() {
     await run(settings, dem, release_point);
     plotOutput();
     plotPosition();
+    plotTimer();
 }
 
 main();
