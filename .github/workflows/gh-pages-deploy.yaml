@@ -1,9 +1,12 @@
 name: Deploy to GitHub Pages
 
+permissions:
+  contents: write
+  
 on:
   push:
     branches:
-      - main  # or your branch
+      - main 
 
 jobs:
   deploy:
@@ -11,7 +14,7 @@ jobs:
 
     steps:
       - name: Checkout repo
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
 
       - name: Copy files with excludes
         run: |
