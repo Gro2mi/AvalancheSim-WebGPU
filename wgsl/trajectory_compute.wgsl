@@ -46,12 +46,16 @@ struct TimestepData {
 @group(0) @binding(0) var<uniform> settings: Settings;
 @group(0) @binding(1) var<uniform> input_point: Point2;
 @group(0) @binding(2) var dem_texture: texture_2d<f32>;
-@group(0) @binding(3) var tex_sampler: sampler;
-@group(0) @binding(7) var normals_texture: texture_2d<f32>;
+@group(0) @binding(3) var normals_texture: texture_2d<f32>;
+@group(0) @binding(4) var release_points_texture: texture_2d<f32>;
+@group(0) @binding(5) var tex_sampler: sampler;
 
-@group(0) @binding(4) var<storage, read_write> sim_info: SimInfo;
-@group(0) @binding(5) var<storage, read_write> out_buffer: array<TimestepData>;
-@group(0) @binding(6) var<storage, read_write> out_debug: array<f32>;
+@group(0) @binding(6) var<storage, read_write> sim_info: SimInfo;
+@group(0) @binding(7) var<storage, read_write> out_buffer: array<TimestepData>;
+@group(0) @binding(8) var<storage, read_write> out_debug: array<f32>;
+
+@group(0) @binding(9) var<storage, read_write> output_texture_buffer: array<atomic<u32>>; // trajectory texture
+@group(0) @binding(10) var<storage, read_write> output_velocity_texture_buffer: array<atomic<u32>>; // trajectory texture
 
 const g: f32 = 9.81;
 const density: f32 = 200.0;
@@ -71,53 +75,115 @@ fn get_starting_point_uv(id: vec3<u32>) -> vec2f {
     return uv;
 }
 
-@compute @workgroup_size(1)
-fn main() {
+fn cell_coords_to_index(cell: vec2u) -> u32 {
+    let grid = vec2u(textureDimensions(dem_texture));
+      return (cell.y % u32(grid.y)) * u32(grid.x) +
+              (cell.x % u32(grid.x));
+    }
+
+
+fn get_release_point_slab_thickness(cell: vec2u) -> f32 {
+    let mask = textureLoad(release_points_texture, cell, 0).rgba;
+    return mask.a;
+}
+
+fn uv_to_cell_coords(uv: vec2f) -> vec2u {
+    let coords = vec2u(clamp(floor(uv * vec2f(textureDimensions(dem_texture))), vec2f(0.0), vec2f(textureDimensions(dem_texture) - vec2u(1))));
+    return coords;
+}
+
+fn uv_to_cell_index(uv: vec2f) -> u32 {
+    let coords = uv_to_cell_coords(uv);
+    return cell_coords_to_index(coords);
+}
+
+fn cell_coords_to_uv(cell: vec2u) -> vec2f {
+    let tex_size = vec2f(textureDimensions(dem_texture));
+    return (vec2f(cell) + 0.5) / tex_size; // center of the cell
+}
+
+fn cell_coords_to_world(cell: vec2u) -> vec2f {
+    let uv = cell_coords_to_uv(cell);
+    return uv_to_world(uv);
+}
+
+fn world_to_cell_coords(world_pos: vec2f) -> vec2u {
+    let uv = world_to_uv(world_pos);
+    return uv_to_cell_coords(uv);
+}
+
+@compute @workgroup_size(16, 16, 1)
+fn computeMain(@builtin(global_invocation_id) cell: vec3<u32>) {
+    let centroid_cell = world_to_cell_coords(vec2f(input_point.x, input_point.y));
+    let texture_dimensions = textureDimensions(dem_texture);
+    if (cell.x >= texture_dimensions.x || cell.y >= texture_dimensions.y) {
+        return;
+    }
+    let slab_thickness = get_release_point_slab_thickness(cell.xy);
+    if (slab_thickness < 0.0001) {
+        return; // no release point at this cell
+    }
     let domain_size = vec2f(settings.boundary.x_max - settings.boundary.x_min, settings.boundary.y_max - settings.boundary.y_min);
     let dxy = domain_size / vec2f(textureDimensions(dem_texture));
-    let elevation_threshold = min_elevation();
+    let elevation_threshold = min_elevation() - 0.1;
     let dxy_min = min(dxy.x, dxy.y);
+    // let start_uv = world_to_uv(vec2f(input_point.x, input_point.y));
+    let start_uv = cell_coords_to_uv(cell.xy);
     sim_info.dxy_min = dxy_min;
-    var last: TimestepData;
-    sim_info.step_count = settings.num_steps;
-    last.uv = world_to_uv(vec2f(input_point.x, input_point.y));
 
     // webigeo copy part,
     // uncomment steps_count.value
+    var last: TimestepData;
+    last.uv = start_uv;
     last.elevation = get_elevation(last.uv);
     last.normal = get_normal(last.uv);
-    last.position = vec3f(input_point.x, input_point.y, last.elevation);
+    let start_postion = cell_coords_to_world(cell.xy);
+    last.position = vec3f(start_postion.x, start_postion.y, last.elevation);
+    // this is not possible in webigeo
+    // last.position = vec3f(0, 0, last.elevation);
     last.velocity = vec3f(0f, 0f, 0f);
-//     var last_velocity = vec3<f32>(0f, 0f, 0f);
     last.acceleration_tangential = acceleration_gravity + g * last.normal.z * last.normal;
     last.acceleration_friction_magnitude = 0f;
     // estimation of the first timestep to calculate actual timestep, safety factor of 1.1 needs to be
     // bigger than 1.0 because it's in the divisor later
     last.dt = sqrt(settings.cfl * dxy_min / length(last.acceleration_tangential)) * 1.1;
-    update_output_data(0u, last);
-
+    if (centroid_cell.x == cell.x && centroid_cell.y == cell.y) {
+        update_output_data(0u, last);
+    }
+    var step_count: u32 = 0u;
     for (var i: u32 = 0u; i < settings.num_steps; i++) {
         let current: TimestepData = compute_timestep(last, dxy_min);
-        update_output_data(i + 1u, current);
+        if (centroid_cell.x == cell.x && centroid_cell.y == cell.y) {
+            update_output_data(i + 1u, current);
+        }
+        // if(uv_to_cell_index(current.uv) != uv_to_cell_index(last.uv)) {
+        // }
+        let cell_index = uv_to_cell_index(current.uv);
+        atomicAdd(&output_texture_buffer[cell_index], 1u);
+        atomicMax(&output_velocity_texture_buffer[cell_index], u32(length(current.velocity))); // ensure that the velocity is not zero, this is needed for the next step
+
         // TODO more sophisticated projection methods
         last = current;
         last.position.z = last.elevation;
 
         // stop criterion friction
         if (length(current.velocity) < 0.0001) {
-            sim_info.step_count = i + 2u;
+            step_count = i + 2u;
             break;
         }
         // out of bounds or non rectangular terrain
         if(current.uv.x < 0.0 || current.uv.x > 1.0 || current.uv.y < 0.0 || current.uv.y > 1.0 
             || last.elevation < elevation_threshold){
-            sim_info.step_count = i;
+            step_count = i;
             break;
         }
         
     }
-    out_debug[0] = last.position.x;
-    out_debug[1] = last.position.y;
+    if (centroid_cell.x == cell.x && centroid_cell.y == cell.y) {
+        sim_info.step_count = step_count;
+    }
+    out_debug[0] = last.normal.x;
+    out_debug[1] = last.normal.y;
     out_debug[2] = last.uv.x;
     out_debug[3] = last.uv.y;
     out_debug[4] = get_elevation(last.uv);
@@ -128,6 +194,7 @@ fn main() {
     out_debug[10] = settings.boundary.y_max;
 
 }
+
 
 fn compute_timestep(last: TimestepData, dxy_min: f32) -> TimestepData {
         var current: TimestepData;
@@ -241,5 +308,5 @@ fn min_elevation() -> f32 {
             }
         }
     }
-    return min_val - 0.1;
+    return min_val;
 }

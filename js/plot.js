@@ -28,8 +28,8 @@ async function plotDem(dem) {
                 },
             },
         };
-
         const data = [surfaceDem];
+
         const layout = layout_3d;
         Plotly.newPlot('demPlot', data, layout);
     } catch (error) {
@@ -128,6 +128,7 @@ function plotPosition() {
         // If the plotDiv.data is undefined, we can skip the deletion
         console.warn('demPlot.data is undefined, skipping trace deletion.');
     }
+
     Plotly.addTraces(demPlot, [lineTrace]);
 }
 
@@ -393,4 +394,79 @@ function plotTimer() {
     };
 
     Plotly.newPlot("timerPlot", data, layout);
+    plotStuff();
+}
+
+function plotStuff() {
+    const dem2d = to2DFloatArray(dem.arr1d, dem.width, dem.height).map(typedArr => Array.from(typedArr));
+    const z = dem2d.map(row => row.map(val => (val < 1 ? null : val)));
+    const maxValue = max(simData.texture);
+    const intensity = to2DFloatArray(simData.texture.map(value => value < 1 ? null : Math.log10(value)), dem.width, dem.height).map(typedArr => Array.from(typedArr));
+    const velocity = to2DFloatArray(simData.velocityTexture, dem.width, dem.height).map(typedArr => Array.from(typedArr));
+    const releaseSlabThickness = to2DFloatArray(releasePoints.filter((_, index) => (index + 1) % 4 === 0), dem.width, dem.height).map(typedArr => Array.from(typedArr));
+    const aspect = to2DFloatArray([...releasePoints].filter((_, index) => (index + 2) % 4 === 0).map(value => (value/255* 180 / Math.PI + 360) % 360), dem.width, dem.height).map(typedArr => Array.from(typedArr));
+    const roughness = to2DFloatArray([...releasePoints].filter((_, index) => (index + 3) % 4 === 0).map(value => value / 50 / 255), dem.width, dem.height).map(typedArr => Array.from(typedArr));
+    const slope = to2DFloatArray([...releasePoints].filter((_, index) => (index + 0) % 4 === 0).map(value => value/255* 180 / Math.PI), dem.width, dem.height).map(typedArr => Array.from(typedArr));
+    // const release = to2DFloatArray(releasePoints, dem.width, dem.height).map(typedArr => Array.from(typedArr));
+    // intensity = intensity.map(row => row.map(val => (val < 1 ? 0 : 1)));
+    console.log('Max value:', maxValue);
+    const customdata = roughness.map((row, i) =>
+        row.map((val, j) => [val])
+    );
+    const surfaceOutputTexture = {
+        type: 'surface',
+            colorscale: 'Portland',
+        x: x,
+        y: y,
+        z: [...z],
+        surfacecolor: roughness,
+        customdata: roughness.map(row => row.map(val => [val])),
+        hovertemplate:
+            'x: %{x}<br>' +
+            'y: %{y}<br>' +
+            'z: %{z}<br>' +
+            'color: %{customdata}<extra></extra>'
+    }
+    const layout = { ...layout_3d };
+    layout.updatemenus = [{
+        buttons: [
+            {
+                method: 'restyle',
+                args: ['surfacecolor', [roughness]],
+                label: 'Roughness'
+            },
+            {
+                method: 'restyle',
+                args: ['surfacecolor', [intensity]],
+                label: 'Intensity'
+            },
+            {
+                method: 'restyle',
+                args: ['surfacecolor', [velocity]],
+                label: 'Velocity'
+            },
+            {
+                method: 'restyle',
+                args: ['surfacecolor', [releaseSlabThickness]],
+                label: 'Release Area'
+            },
+            {
+                method: 'restyle',
+                args: ['surfacecolor', [slope]],
+                label: 'Slope Angle'
+            },
+            {
+                method: 'restyle',
+                args: ['surfacecolor', [aspect]],
+                label: 'Slope Aspect'
+            },
+        ],
+        direction: 'up',
+        showactive: true,
+        x: 1,
+        xanchor: 'right',
+        y: 0,
+        yanchor: 'top',
+    }];
+    Plotly.newPlot('outputTexturePlot', [surfaceOutputTexture], layout)
 }

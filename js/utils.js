@@ -68,7 +68,7 @@ class SimSettings {
     constructor() {
     }
 
-    async set(casename, maxSteps, simModel, frictionModel, density, slabThickness, frictionCoefficient, dragCoefficient, cfl, boundary) {
+    async set(casename, maxSteps, simModel, frictionModel, density, slabThickness, frictionCoefficient, dragCoefficient, cfl, numbersTrajectories, boundary) {
         this.casename = casename;
         
         this.maxSteps = maxSteps;
@@ -80,6 +80,7 @@ class SimSettings {
         this.dragCoefficient = dragCoefficient;
         this.cfl = cfl;
         this.bounds = await fetchBounds(this.casename);
+        this.numberTrajectories = numbersTrajectories;
     }
 
     createBuffer() {
@@ -136,6 +137,8 @@ class SimData {
         this.travelDistance = [];
         this.cfl = [];
         this.dxyMin = dxyMin;
+        this.texture;
+        this.velocityTexture;
     }
 
     addDataExplicit(timestep, time, accelerationFrictionMagnitude, accelerationTangentialMagnitude, velocityMagnitude, position, elevation) {
@@ -198,6 +201,12 @@ class SimData {
             this.cfl.push(this.velocityMagnitude[n] * this.timestep[n] / this.dxyMin);
         }
     }
+}
+
+function countLines(str) {
+  if (!str) return 0;
+  // Split by newline, count resulting array length
+  return str.split('\n').length;
 }
 
 function max(arr) {

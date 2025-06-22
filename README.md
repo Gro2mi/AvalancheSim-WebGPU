@@ -9,4 +9,4 @@ Requirements: Python (or Webserver), Browser with [WebGPU support](https://caniu
 
 1. Go to this directory
 2. Start server with `python -m http.server 8000`
-3. Open Chrome on [http://localhost:8000/](http://localhost:8000/)
+3. Open Chrome on [http://localhost:8000/](http://localhost:8000/) or [http://localhost:8000/?debug=vscode](http://localhost:8000/?debug=vscode) for debugging mode
