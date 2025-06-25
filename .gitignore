@@ -2,3 +2,6 @@ avalancheSim.code-workspace
 test.html
 js/test.js
 wgsl/test.wgsl
+forest_data/
+forestDataCLC/
+*.pem

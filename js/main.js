@@ -1,3 +1,4 @@
+var dem = new Dem();
 
 const demDropdown = document.getElementById('demDropdown');
 const frictionModelDropdown = document.getElementById('frictionModelDropdown');
@@ -24,14 +25,33 @@ const dragCoefficientValue = document.getElementById('dragCoefficientValue');
 dragCoefficientSlider.addEventListener('input', () => {
     dragCoefficientValue.textContent = dragCoefficientSlider.value;
 });
+const numberTrajectoriesSlider = document.getElementById('numberTrajectoriesSlider');
+const numberTrajectoriesValue = document.getElementById('numberTrajectoriesValue');
+numberTrajectoriesSlider.addEventListener('input', () => {
+    numberTrajectoriesValue.textContent = numberTrajectoriesSlider.value;
+});
+
+const zoomLevelSlider = document.getElementById('zoomLevelSlider');
+const zoomLevelValue = document.getElementById('zoomLevelValue');
+zoomLevelValue.textContent = zoomLevelSlider.value + ' Resolution: ' + pixelWidthMeters(zoomLevelSlider.value, 47.2).toFixed(2) + ' m';
+zoomLevelSlider.addEventListener('change', () => {
+    zoomLevelValue.textContent = zoomLevelSlider.value + ' Resolution: ' + pixelWidthMeters(zoomLevelSlider.value, 47.2).toFixed(2) + ' m';
+    dem.loadTiles(gpx, zoom = zoomLevelSlider.value).then(() => {
+        plotDem(dem);
+        plotGpx(gpx)
+    });
+
+});
 
 demDropdown.addEventListener('change', async (event) => {
     const selectedFile = event.target.value;
     localStorage.setItem('demDropdown', selectedFile);
-    fetchInputs().then(() => {
-        plotDem(dem);
-    })
-    await runAndPlot();
+    await dem.loadPNGAsFloat32(selectedFile);
+    plotDem(dem); 
+    await fetchInputs();
+    if (!isMobileDevice) {
+        runAndPlot();
+    }    
 });
 
 frictionModelDropdown.addEventListener('change', (event) => {
@@ -60,12 +80,21 @@ runButton.addEventListener('click', async () => {
 
 async function runAndPlot() {
     console.log('Run simulation');
-    await fetchInputs();
-    await run(settings, dem, release_point);
+    await run(simSettings, dem, release_point);
     plotOutput();
     plotPosition();
+    plotHistogram();
+    simTimer.checkpoint('plotting');
     plotTimer();
+    plotVariable.value = 'cellCount';
+    plotVariable.dispatchEvent(new Event('change'));
 }
+
+plotVariable = document.getElementById('plotVariable');
+plotVariable.addEventListener('change', async (event) => {
+    const selectedVariable = event.target.value;
+    updatePlots(selectedVariable)
+});
 
 document.addEventListener('keydown', async function (event) {
     console.log('Key pressed:', event.key);
@@ -87,7 +116,7 @@ window.addEventListener('DOMContentLoaded', () => {
 });
 
 async function getSettings() {
-    await settings.set(
+    await simSettings.set(
         casename = demDropdown.value,
         maxSteps = parseInt(stepSlider.value),
         simModel = 0,
@@ -97,6 +126,7 @@ async function getSettings() {
         frictionCoefficient = frictionCoefficientSlider.value,
         dragCoefficient = dragCoefficientSlider.value,
         cfl = parseFloat(cflSlider.value),
+        numberTrajectories = parseInt(numberTrajectoriesSlider.value),
     )
 }
 
@@ -108,50 +138,88 @@ async function loadReleasePoints(casename) {
 
 async function fetchInputs() {
     await getSettings();
-    dem = await loadPNGAsFloat32(settings.casename);
-    release_points = await loadReleasePoints(settings.casename);
+    release_points = await loadReleasePoints(simSettings.casename);
     release_point = release_points.centroids[0]
-    x = linspace(settings.bounds.xmin, settings.bounds.xmax, dem.width);
-    y = linspace(settings.bounds.ymin, settings.bounds.ymax, dem.height);
     return true;
 }
-var settings = new SimSettings();
+var simSettings = new SimSettings();
 var release_points;
 var release_point;
 // fetchAabb(demDropdown.value);
 async function main() {
-    if (!navigator.gpu) {
-        console.error("WebGPU not supported");
-        alert("WebGPU not supported. Please use a compatible browser like Chrome.");
+    const adapter = await navigator.gpu?.requestAdapter({
+        powerPreference: 'high-performance',
+        featureLevel: 'compatibility',
+    });
+
+    if (!adapter) {
+        alert("WebGPU is not supported or failed to initialize. Please use a compatible browser like Chrome.");
         runButton.disabled = true;
         runButton.textContent = "WebGPU not supported";
-    }
-    try {
-        adapter = await navigator.gpu.requestAdapter();
-        if (!adapter.features.has("float32-filterable")) {
-            alert("Your device has to support float32-filterable textures to run this.");
-            runButton.disabled = true;
-            runButton.textContent = "WebGPU not supported";
-        }
-    } catch (error) {
-        console.error("WebGPU not supported.", error);
-        alert("WebGPU not supported. Please use a compatible browser like Chrome.");
+    } else if (!adapter.features.has("float32-filterable")) {
+        alert("Your device has to support float32-filterable textures to run this.");
         runButton.disabled = true;
         runButton.textContent = "WebGPU not supported";
+    } else {
+        console.log("Adapter limits:", adapter.limits);
+        const maxInvocations = adapter.limits.maxComputeInvocationsPerWorkgroup;
+        const workgroupSizeXY = Math.floor(Math.sqrt(maxInvocations));
+        console.log("Release point:", release_point);
+        device = await adapter.requestDevice({
+            requiredFeatures: ["float32-filterable"],
+            requiredLimits: {
+                maxComputeWorkgroupSizeX: workgroupSizeXY,
+                maxComputeWorkgroupSizeY: workgroupSizeXY,
+                maxComputeWorkgroupSizeZ: 1,
+                maxComputeInvocationsPerWorkgroup: maxInvocations
+            }
+        });
+        device.lost.then(err => {
+            console.error('WebGPU device lost:', err);
+            alert('WebGPU device lost.', err);
+        });
     }
+
     changeFrictionModel();
     // await getSettings();
     await fetchInputs();
+    
+    await dem.loadPNGAsFloat32(simSettings.casename);
+    // const gpxString = await fetch('gpx/NockspitzeNDirectTop.gpx').then(response => response.text());
+    // gpx = parseGPX(gpxString);
+    // await dem.loadTiles(gpx, zoom = zoomLevelSlider.value)
+    console.log("dem width:", dem.bounds.width, "height:", dem.bounds.height);
     plotDem(dem); // Initial plot
+    // plotGpx(gpx); // Initial plot
+    
     // await computeNormalsFromDemTexture(settings, dem);
-    console.log("Release point:", release_point);
-    device = await adapter.requestDevice({
-        requiredFeatures: ["float32-filterable"],
-    });
-    await run(settings, dem, release_point);
-    plotOutput();
-    plotPosition();
-    plotTimer();
+    if (!isMobileDevice) {
+        runAndPlot();
+    }    
 }
+
+
+var gpx;
+var tiles = [];
+document.getElementById("gpxfile").addEventListener("change", async (e) => {
+    const file = e.target.files[0];
+    if (!file) return;
+
+    gpxString = await file.text();
+    tiles = [];
+    gpx = parseGPX(gpxString);
+    await dem.loadTiles(gpx, zoom = zoomLevelSlider.value)
+    plotDem(dem);
+    plotGpx(gpx);
+
+});
+
+debug = false;
+const urlParams = new URLSearchParams(window.location.search);
+if (urlParams.get("debug") === "vscode") {
+    debug = true;
+    console.log("Running in VS Code debug session");
+}
+isMobileDevice = /Mobi|Android|iPhone|iPad|iPod/i.test(navigator.userAgent);
 
 main();

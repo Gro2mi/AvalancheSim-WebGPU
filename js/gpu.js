@@ -1,45 +1,157 @@
 var simData, releasePoints;
 var device;
+
 var simTimer = new Timer("Avalanche Simulation");
 
-async function run(settings, dem, release_point) {
+class Shader {
+  constructor(name) {
+    this.name = name;
+    this.code = null;
+    this.module = null;
+    this.pipeline = null;
+    this.bindGroup = null;
+    this.computePass = null;
+  }
+
+  async compile(lineOffset = 0) {
+    if (!this.code) {
+      throw new Error("Shader code is not set for " + this.name);
+    }
+    this.module = device.createShaderModule({ code: this.code });
+    const info = await this.module.getCompilationInfo();
+    if (info.messages.length > 0) {
+      console.group(this.name + " Shader Compilation Messages:");
+      for (const msg of info.messages) {
+        const type = msg.type.toUpperCase();
+        console.log(`${type} [${msg.lineNum - lineOffset}:${msg.linePos}] ${msg.message}`);
+      }
+      console.groupEnd();
+
+      const hadError = info.messages.some(m => m.type === "error");
+      if (hadError) {
+        throw new Error(this.name + " Shader Compilation failed. See log for details.");
+      }
+    } else {
+      console.log(this.name + " Shader compiled successfully.");
+    }
+    return this.module;
+  }
+
+  createPipeline() {
+    if (!this.module) {
+      throw new Error("Shader module is not created for " + this.name);
+    }
+    this.pipeline = device.createComputePipeline({
+      label: this.name + " Compute Pipeline",
+      layout: 'auto',
+      compute: { module: this.module, entryPoint: 'computeMain' },
+    });
+    return this.pipeline;
+  }
+
+  createBindGroup(entries) {
+    if (!this.pipeline) {
+      throw new Error("Pipeline is not created for " + this.name);
+    }
+    this.bindGroup = device.createBindGroup({
+      label: this.name + " BindGroup",
+      layout: this.pipeline.getBindGroupLayout(0),
+      entries: entries,
+    });
+    return this.bindGroup;
+  }
+
+  createComputePass(commandEncoder, n = 1,
+    workgroupSize = [
+      Math.ceil(dem.width / 16),
+      Math.ceil(dem.height / 16)
+    ]) {
+    if (!this.pipeline) {
+      throw new Error("Pipeline is not created for " + this.name);
+    }
+    if (!this.bindGroup) {
+      throw new Error("BindGroup is not created for " + this.name);
+    }
+    this.computePass = commandEncoder.beginComputePass({ label: this.name + " Compute Pass" });
+    this.computePass.setPipeline(this.pipeline);
+    for (let i = 0; i < n; i++) {
+      this.computePass.setBindGroup(0, this.bindGroup);
+      this.computePass.dispatchWorkgroups(...workgroupSize);
+    }
+    this.computePass.end();
+  }
+}
+
+
+
+class Shaders {
+  constructor() {
+    this.shaderImports = new Shader("Imports");
+    this.linesImported = 0;
+
+    this.normals = new Shader("Normals");
+    this.releasePoints = new Shader("ReleasePoints");
+    this.trajectory = new Shader("Trajectory");
+  }
+
+  async fetch() {
+    // TODO: implement include functionality for WGSL
+    this.shaderImports.code = await loadAndConcatShaders([
+      "wgsl/util/tile_util.wgsl",
+      "wgsl/util/normals_util.wgsl",
+      "wgsl/util/tile_hashmap.wgsl",
+      "wgsl/util/filtering.wgsl",
+      'wgsl/util/color_mapping.wgsl'
+    ]);
+    await this.shaderImports.compile();
+    this.linesImported = countLines(this.shaderImports.code);
+
+    this.normals.code = await loadAndConcatShaders(['wgsl/normals_compute.wgsl']);
+    this.releasePoints.code = this.shaderImports.code + await loadAndConcatShaders(['wgsl/release_points_compute.wgsl']);
+    this.trajectory.code = await loadAndConcatShaders(['wgsl/trajectory_compute.wgsl']);
+  }
+
+  async compile() {
+    // await this.decodeDem.compile();
+    await this.normals.compile();
+    await this.releasePoints.compile(this.linesImported);
+    await this.trajectory.compile();
+  }
+
+  createPipelines() {
+    this.normals.createPipeline();
+    this.releasePoints.createPipeline();
+    this.trajectory.createPipeline();
+  }
+
+  static async fetchAndConcat(urls) {
+    const codes = await Promise.all(
+      urls.map(url => fetch(url).then(res => res.text()))
+    );
+    return codes.join('\n') + '\n';
+  }
+
+}
+
+var shaders = new Shaders();
+
+
+async function run(simSettings, dem, release_point) {
   simTimer = new Timer("Avalanche Simulation")
-
-  // wgsl doesn't support imports
-  const shaderNormals = await loadAndConcatShaders([
-    "wgsl/util/tile_util.wgsl",
-    "wgsl/util/normals_util.wgsl",
-    "wgsl/util/tile_hashmap.wgsl",
-    "wgsl/util/filtering.wgsl",
-    'wgsl/normals_compute.wgsl'
-  ])
+  // only load shaders if not already loaded or in debug mode
+  if (debug || shaders.normals.code == null) {
+    await shaders.fetch();
+    simTimer.checkpoint("shader fetching");
+    await shaders.compile();
+    simTimer.checkpoint("shader compilation");
+    shaders.createPipelines();
+  }
 
   
-  const shaderReleasePoints = await loadAndConcatShaders([
-    "wgsl/util/tile_util.wgsl",
-    "wgsl/util/normals_util.wgsl",
-    "wgsl/util/tile_hashmap.wgsl",
-    "wgsl/util/filtering.wgsl",
-    'wgsl/release_points_compute.wgsl',
-    'wgsl/util/color_mapping.wgsl'
-  ])
-  
-  const shaderCode = await fetch('wgsl/trajectory_compute.wgsl').then(r => r.text());
-  simTimer.checkpoint("shader fetching");
+  const boundsBuffer = createInputBuffer(device, 4);
+  device.queue.writeBuffer(boundsBuffer, 0, new Float32Array([dem.world_resolution]));
 
-  const normalsModule = await checkWGSL(device, shaderNormals);
-  const releasePointsModule = await checkWGSL(device, shaderReleasePoints);
-  const trajectoryModule = await checkWGSL(device, shaderCode);
-  simTimer.checkpoint("shader compilation");
-  
-  const boundsData = new Float32Array([
-    settings.bounds.xmin, settings.bounds.ymin,
-    settings.bounds.xmax, settings.bounds.ymax,
-  ]);
-  const boundsBuffer = createInputBuffer(device, 4 * 4);
-  device.queue.writeBuffer(boundsBuffer, 0, boundsData);
-
-  const demTexture = createTextureAndBuffer(device, dem);
+  const demTexture = createDemTextureAndBuffer(device);
 
   // Create output texture for normals
   const normalsTexture = device.createTexture({
@@ -51,26 +163,22 @@ async function run(settings, dem, release_point) {
       | GPUTextureUsage.COPY_DST,
   });
 
-  const normalsPipeline = device.createComputePipeline({
-    layout: 'auto',
-    compute: { module: normalsModule, entryPoint: 'computeMain' },
-  });
-  // Step 3: Create bind group
-  const normalsBindGroup = device.createBindGroup({
-    layout: normalsPipeline.getBindGroupLayout(0),
-    entries: [
-      { binding: 0, resource: { buffer: boundsBuffer } },
-      { binding: 1, resource: demTexture.createView() },
-      { binding: 2, resource: normalsTexture.createView() },
-    ],
-  });
+  const outDebugNormals = createStorageBuffer(device, 4 * 10);
+  const readbackDebugNormals = createReadbackBuffer(device, 10 * 4);
+  
+  shaders.normals.createBindGroup([
+    { binding: 0, resource: { buffer: boundsBuffer } },
+    { binding: 1, resource: demTexture.createView() },
+    { binding: 2, resource: normalsTexture.createView() },
+    { binding: 3, resource: { buffer: outDebugNormals } },
+  ],
+  );
+
 
   // Release points compute shader
-
-
   const releasePointsSettings = {
-    minSlopeAngle: 35 / 180 * Math.PI,
-    maxSlopeAngle: 45 / 180 * Math.PI,
+    minSlopeAngle: 35,
+    maxSlopeAngle: 45,
     minElevation: 1500,
     slabThickness: 1,
   };
@@ -92,20 +200,13 @@ async function run(settings, dem, release_point) {
       | GPUTextureUsage.COPY_DST,
   });
 
-  const releasePointsPipeline = device.createComputePipeline({
-    layout: 'auto',
-    compute: { module: releasePointsModule, entryPoint: 'computeMain' },
-  });
-  // Step 3: Create bind group
-  const releasePointsBindGroup = device.createBindGroup({
-    layout: releasePointsPipeline.getBindGroupLayout(0),
-    entries: [
-      { binding: 0, resource: { buffer: releasePointsSettingsBuffer } },
-      { binding: 1, resource: demTexture.createView() },
-      { binding: 2, resource: normalsTexture.createView() },
-      { binding: 3, resource: releasePointsTexture.createView() },
-    ],
-  });
+  shaders.releasePoints.createBindGroup([
+    { binding: 0, resource: { buffer: releasePointsSettingsBuffer } },
+    { binding: 1, resource: demTexture.createView() },
+    { binding: 2, resource: normalsTexture.createView() },
+    { binding: 3, resource: releasePointsTexture.createView() },
+  ],
+  );
 
   const unpaddedBytesPerRow = dem.width * 4;
   const paddedBytesPerRow = Math.ceil(unpaddedBytesPerRow / 256) * 256;
@@ -122,9 +223,8 @@ async function run(settings, dem, release_point) {
 
   const settingsBuffer = createInputBuffer(device, SimSettings.byteSize);
   const inputPointBuffer = createInputBuffer(device, inputPointData.byteLength);
-  console.log("bounds: ", settings.bounds);
 
-  device.queue.writeBuffer(settingsBuffer, 0, settings.createBuffer());
+  device.queue.writeBuffer(settingsBuffer, 0, simSettings.createBuffer());
   device.queue.writeBuffer(inputPointBuffer, 0, inputPointData);
 
   const sampler = device.createSampler({
@@ -132,76 +232,66 @@ async function run(settings, dem, release_point) {
     minFilter: 'linear',
   });
 
+  const outputTextureSize = 4 * dem.width * dem.height; // 4 bytes per u32
+  // const outputTextureBuffer = device.createBuffer({
+  //   size: outputTextureSize,
+  //   usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,
+  // });
+  const outputTextureBuffer = createStorageBuffer(device, outputTextureSize);
+  const outputVelocityTextureBuffer = createStorageBuffer(device, outputTextureSize);
+
   // Create all output buffers
-  const simDataBufferSize = SimData.timeStepByteSize * settings.maxSteps;
+  const simDataBufferSize = SimData.timeStepByteSize * simSettings.maxSteps;
   const simInfoBuffer = createStorageBuffer(device, SimInfo.byteSize);
   const outBuffer = createStorageBuffer(device, simDataBufferSize);
   const outDebug = createStorageBuffer(device, 4 * 100);
+  const outAtomicBuffer = device.createBuffer({
+    size: 4,
+    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,
+  });
 
   const readbackSimInfo = createReadbackBuffer(device, SimInfo.byteSize);
   const readbackSimData = createReadbackBuffer(device, simDataBufferSize);
   const readbackDebug = createReadbackBuffer(device, 100 * 4);
-
-
-  // Create shader module and pipeline
-  const trajectoriesPipeline = device.createComputePipeline({
-    layout: 'auto',
-    compute: { module: trajectoryModule, entryPoint: 'main' },
+  const readbackOutputTexture = createReadbackBuffer(device, outputTextureSize);
+  const readbackVelocityTexture = createReadbackBuffer(device, outputTextureSize);
+  const readbackAtomicBuffer = device.createBuffer({
+    size: 4,
+    usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST,
   });
-
 
   // Create bind group
-  const bindGroup = device.createBindGroup({
-    layout: trajectoriesPipeline.getBindGroupLayout(0),
-    entries: [
-      { binding: 0, resource: { buffer: settingsBuffer } },
-      { binding: 1, resource: { buffer: inputPointBuffer } },
-      { binding: 2, resource: demTexture.createView() },
-      { binding: 7, resource: normalsTexture.createView() },
-      { binding: 3, resource: sampler },
-      { binding: 4, resource: { buffer: simInfoBuffer } },
-      { binding: 5, resource: { buffer: outBuffer } },
-      { binding: 6, resource: { buffer: outDebug } },
-    ],
-  });
+  shaders.trajectory.createBindGroup([
+    { binding: 0, resource: { buffer: settingsBuffer } },
+    { binding: 1, resource: { buffer: inputPointBuffer } },
+    { binding: 2, resource: demTexture.createView() },
+    { binding: 3, resource: normalsTexture.createView() },
+    { binding: 4, resource: releasePointsTexture.createView() },
+    { binding: 5, resource: sampler },
 
+    { binding: 6, resource: { buffer: simInfoBuffer } },
+    { binding: 7, resource: { buffer: outBuffer } },
+    { binding: 8, resource: { buffer: outDebug } },
+    { binding: 9, resource: { buffer: outputTextureBuffer } },
+    { binding: 10, resource: { buffer: outputVelocityTextureBuffer } },
+    { binding: 11, resource: { buffer: outAtomicBuffer } },
+  ],
+  );
 
   // Encode commands
   const commandEncoder = device.createCommandEncoder();
-  {
-    const normalsPass = commandEncoder.beginComputePass();
-    normalsPass.setPipeline(normalsPipeline);
-    normalsPass.setBindGroup(0, normalsBindGroup);
-    normalsPass.dispatchWorkgroups(
-      Math.ceil(dem.width / 16),
-      Math.ceil(dem.height / 16)
-    );
-    normalsPass.end();
-  }
-  {
-    const releasePointsPass = commandEncoder.beginComputePass();
-    releasePointsPass.setPipeline(releasePointsPipeline);
-    releasePointsPass.setBindGroup(0, releasePointsBindGroup);
-    releasePointsPass.dispatchWorkgroups(
-      Math.ceil(dem.width / 16),
-      Math.ceil(dem.height / 16)
-    );
-    releasePointsPass.end();
-  }
-  {
-    const trajectoriesPass = commandEncoder.beginComputePass();
-    trajectoriesPass.setPipeline(trajectoriesPipeline);
-    trajectoriesPass.setBindGroup(0, bindGroup);
-    trajectoriesPass.dispatchWorkgroups(1);
-    trajectoriesPass.end();
-  }
+  shaders.normals.createComputePass(commandEncoder);
+  shaders.releasePoints.createComputePass(commandEncoder);
+  shaders.trajectory.createComputePass(commandEncoder, n = simSettings.numberTrajectories);
 
   // Wait for copy to finish
   await device.queue.onSubmittedWorkDone();
   // Copy outputs to readback buffers
   commandEncoder.copyBufferToBuffer(simInfoBuffer, 0, readbackSimInfo, 0, SimInfo.byteSize);
   commandEncoder.copyBufferToBuffer(outBuffer, 0, readbackSimData, 0, maxSteps * SimData.timeStepByteSize);
-  commandEncoder.copyBufferToBuffer(outDebug, 0, readbackDebug, 0, 100 * 4);
+  commandEncoder.copyBufferToBuffer(outputTextureBuffer, 0, readbackOutputTexture, 0, outputTextureSize);
+  commandEncoder.copyBufferToBuffer(outputVelocityTextureBuffer, 0, readbackVelocityTexture, 0, outputTextureSize);
+  commandEncoder.copyBufferToBuffer(outAtomicBuffer, 0, readbackAtomicBuffer, 0, 4);
 
   commandEncoder.copyTextureToBuffer(
     {
@@ -219,6 +309,10 @@ async function run(settings, dem, release_point) {
       depthOrArrayLayers: 1,
     }
   );
+
+  commandEncoder.copyBufferToBuffer(outDebug, 0, readbackDebug, 0, 100 * 4);
+  commandEncoder.copyBufferToBuffer(outDebugNormals, 0, readbackDebugNormals, 0, 10 * 4);
+  
   simTimer.checkpoint("preparation");
   // Submit commands
   device.queue.submit([commandEncoder.finish()]);
@@ -241,16 +335,30 @@ async function run(settings, dem, release_point) {
   console.log("dxy min: ", simInfo.dxyMin);
   // Read results
   const bufferSimData = await readBuffer(readbackSimData, simInfo.stepCount * SimData.timeStepByteSize, Float32Array);
+  const bufferOutputTexture = await readBuffer(readbackOutputTexture, outputTextureSize, Uint32Array);
+  const bufferVelocityTexture = await readBuffer(readbackVelocityTexture, outputTextureSize, Uint32Array);
+  const totalTimesteps = await readBuffer(readbackAtomicBuffer, 4, Uint32Array);
+  console.log("Total timesteps: ", totalTimesteps[0]);
 
   const bufferDebug = await readBuffer(readbackDebug, 100 * 4, Float32Array);
-  descriptions = ["x", "y", "u", "v", "elevation", "elevation_threshold", "", "xmin", "ymin", "xmax", "ymax"];
-  let line = "";
+  descriptions = ["normalx", "normaly", "u", "v", "elevation", "elevation_threshold", "", "xmin", "ymin", "xmax", "ymax"];
+  var line = "";
   for (let i = 0; i < 100; i++) {
     const desc = descriptions[i] || "";
-    if (bufferDebug[i] == 0 && desc == "" ) continue; // Skip empty descriptions
+    if (bufferDebug[i] == 0 && desc == "") continue; // Skip empty descriptions
     line += `${i} ${desc}: ${bufferDebug[i].toFixed(2)}, `;
   }
-  console.log("Debug info: ", line);
+  console.log("Debug info trajectory: ", line);
+
+  const bufferDebugNormals = await readBuffer(readbackDebugNormals, 10 * 4, Float32Array);
+  descriptions = ["nx", "ny", "nz", "dzdx", "dzdy"];
+  line = "";
+  for (let i = 0; i < 10; i++) {
+    const desc = descriptions[i] || "";
+    if (bufferDebugNormals[i] == 0 && desc == "") continue; // Skip empty descriptions
+    line += `(${i}) ${desc}: ${bufferDebugNormals[i].toFixed(4)}, `;
+  }
+  console.log("Debug info normals: ", line);
   simTimer.checkpoint("readback buffer");
 
   await readReleasePointsBuffer.mapAsync(GPUMapMode.READ);
@@ -264,16 +372,17 @@ async function run(settings, dem, release_point) {
     releasePoints.set(mapped.subarray(srcOffset, srcOffset + unpaddedBytesPerRow), dstOffset);
   }
   readReleasePointsBuffer.unmap();
-  
+
   simTimer.checkpoint("readback textures");
   simData = new SimData(simInfo.dxyMin);
   simData.parse(bufferSimData, simInfo.stepCount);
 
   console.log([...bufferSimData.slice(0, 16)]); // Log first 16 floats for debugging
-  simTimer.checkpoint("parse output buffer");
   simTimer.printSummary();
-  exportReleasePointsToPNG(releasePoints, dem.width, dem.height, "releaseCanvas");
-
+  simData.parseVelocityTexture([...bufferVelocityTexture]);
+  simData.parseCellCountTexture([...bufferOutputTexture]);
+  simData.parseReleasePointTexture(releasePoints)
+  simTimer.checkpoint("parse results");
 }
 
 // Create readback buffers (for CPU reading)
@@ -305,29 +414,29 @@ async function loadAndConcatShaders(urls) {
   return codes.join('\n');
 }
 
-function createTextureAndBuffer(device, arr) {
-  const bytesPerRow = Math.ceil(arr.width * 4 / 256) * 256; // 4 bytes per float32 pixel, must be aligned to 256 bytes
+function createDemTextureAndBuffer(device) {
+  const bytesPerRow = Math.ceil(dem.width * 4 / 256) * 256; // 4 bytes per float32 pixel, must be aligned to 256 bytes
 
   const texture = device.createTexture({
-    size: [arr.width, arr.height, 1],
+    size: [dem.width, dem.height, 1],
     format: 'r32float',
-    usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST,
+    usage: GPUTextureUsage.TEXTURE_BINDING
+      | GPUTextureUsage.COPY_DST,
   });
 
   const textureBuffer = device.createBuffer({
-    size: bytesPerRow * arr.height,
+    size: bytesPerRow * dem.height,
     usage: GPUBufferUsage.COPY_SRC,
     mappedAtCreation: true,
   });
 
   const mappedRange = textureBuffer.getMappedRange();
-  const src = arr.arr1d;
   const dst = new Float32Array(mappedRange);
 
-  for (let row = 0; row < arr.height; row++) {
-    const srcOffset = row * arr.width;
+  for (let row = 0; row < dem.height; row++) {
+    const srcOffset = row * dem.width;
     const dstOffset = (bytesPerRow / 4) * row;
-    dst.set(src.subarray(srcOffset, srcOffset + arr.width), dstOffset);
+    dst.set(dem.data1d.subarray(srcOffset, srcOffset + dem.width), dstOffset);
   }
   textureBuffer.unmap();
   const copyEncoder = device.createCommandEncoder();
@@ -339,7 +448,7 @@ function createTextureAndBuffer(device, arr) {
     {
       texture: texture,
     },
-    [arr.width, arr.height, 1]
+    [dem.width, dem.height, 1]
   );
   device.queue.submit([copyEncoder.finish()]);
 
@@ -347,28 +456,6 @@ function createTextureAndBuffer(device, arr) {
 }
 
 
-async function checkWGSL(device, wgslCode) {
-  const shaderModule = device.createShaderModule({ code: wgslCode });
-
-  const info = await shaderModule.getCompilationInfo();
-  if (info.messages.length > 0) {
-    console.group("WGSL Compilation Messages:");
-    for (const msg of info.messages) {
-      const type = msg.type.toUpperCase();
-      console.log(`${type} [${msg.lineNum}:${msg.linePos}] ${msg.message}`);
-    }
-    console.groupEnd();
-
-    const hadError = info.messages.some(m => m.type === "error");
-    if (hadError) {
-      throw new Error("WGSL compilation failed. See log for details.");
-    }
-  } else {
-    console.log("WGSL compiled successfully.");
-  }
-
-  return shaderModule;
-}
 
 function exportReleasePointsToPNG(releasePoints, width, height, canvasId = "releaseCanvas") {
   // Create or select a canvas
@@ -383,29 +470,14 @@ function exportReleasePointsToPNG(releasePoints, width, height, canvasId = "rele
 
   const ctx = canvas.getContext('2d');
   function flipImageDataVertically(src, width, height) {
-  const rowSize = width * 4; // 4 bytes per pixel (RGBA)
-  const flipped = new Uint8ClampedArray(src.length);
+    const rowSize = width * 4; // 4 bytes per pixel (RGBA)
+    const flipped = new Uint8ClampedArray(src.length);
 
-  for (let y = 0; y < height; y++) {
-    const srcOffset = y * rowSize;
-    const dstOffset = (height - 1 - y) * rowSize;
-    flipped.set(src.subarray(srcOffset, srcOffset + rowSize), dstOffset);
+    for (let y = 0; y < height; y++) {
+      const srcOffset = y * rowSize;
+      const dstOffset = (height - 1 - y) * rowSize;
+      flipped.set(src.subarray(srcOffset, srcOffset + rowSize), dstOffset);
+    }
+    return flipped;
   }
-  return flipped;
-}
-
-// Usage:
-const flippedPixels = flipImageDataVertically(releasePoints, width, height);
-const imageData = ctx.createImageData(width, height);
-imageData.data.set(flippedPixels);
-ctx.putImageData(imageData, 0, 0);
-
-
-  // Convert canvas to PNG and trigger download
-  const pngURL = canvas.toDataURL('image/png');
-
-  const link = document.createElement('a');
-  link.download = 'release_points.png';
-  link.href = pngURL;
-  // link.click();
 }
