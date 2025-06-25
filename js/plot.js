@@ -1,22 +1,31 @@
+const outputPlot = document.getElementById('outputPlot');
+const demPlot = document.getElementById('demPlot');
+const histogramPlot = document.getElementById('histogramPlot');
+const resetLighting = {
+    ambient: 0.8,
+    diffuse: 0.8,
+    specular: 0.05,
+    roughness: 0.5,
+    fresnel: 0.2,
+}
+
 async function plotDem(dem) {
     try {
-        const dem2d = to2DFloatArray(dem.arr1d, dem.width, dem.height).map(typedArr => Array.from(typedArr));
-        const z = dem2d.map(row => row.map(val => (val < 1 ? null : val)));
         const surfaceDem = {
-            x: x,
-            y: y,
-            z: [...z],
+            x: dem.x,
+            y: dem.y,
+            z: dem.z,
             type: 'surface',
             colorscale: 'Earth',
             cmin: 0,
             cmax: 3000,
-            lighting: {
-                ambient: 0.1,      // less ambient = darker shadows
-                diffuse: 0.4,      // more diffuse = softer shadows
-                specular: 1.0,     // strong highlights
-                roughness: 0.7,    // lower = shinier
-                fresnel: 0.0       // optional for reflectivity
-            },
+            // lighting: {
+            //     ambient: 0.1,      // less ambient = darker shadows
+            //     diffuse: 0.4,      // more diffuse = softer shadows
+            //     specular: 1.0,     // strong highlights
+            //     roughness: 0.7,    // lower = shinier
+            //     fresnel: 0.0       // optional for reflectivity
+            // },
             contours: {
                 z: {
                     show: true,
@@ -28,76 +37,116 @@ async function plotDem(dem) {
                 },
             },
         };
-
         const data = [surfaceDem];
-        const layout = layout_3d;
+
+        const layout = {
+            template: plotly_dark,
+            scene: {
+                aspectmode: 'data', 
+            }
+        };
         Plotly.newPlot('demPlot', data, layout);
     } catch (error) {
         console.error('Error loading or plotting data:', error);
     }
 }
+const cyclicAspectColorscale = [
+    [0.0, 'blue'],     // 0° North
+    [0.25, 'green'],    // 90° East
+    [0.5, 'red'],      // 180° South
+    [0.75, 'yellow'],   // 270° West
+    [1.0, 'blue']      // 360° North again to close the loop
+];
+function updatePlots(selectedVariable) {
+    var traceHist = {
+        type: 'histogram',
+        x: simData[selectedVariable].flat(),
+        autobinx: true, // or set fixed bin settings
+    };
 
-let layout_3d = {
-    title: '3D DEM Plot',
+    const layoutHist = {
+        title: `Histogram of ${selectedVariable}`,
+        template: plotly_dark,
+    };
 
-    template: 'plotly_dark',
-    autosize: true,
-    scene: {
-        aspectmode: 'data',
-        zaxis: {
-            title: 'Elevation',
-            titlefont: { color: '#bbb' },
-            gridcolor: '#aaa',
-            tickfont: { color: '#ccc' }
+        Plotly.update(demPlot, {
+            surfacecolor: [simData[selectedVariable]],  // new data
+            cmin: [null],                               // reset min
+            cmax: [null],                               // reset max
+            colorscale: ['Portland'],
+            colorbar: {
+                title: plotVariable.options[plotVariable.selectedIndex].text
+            },
+            lighting: resetLighting,
+
+        });
+    if (selectedVariable === 'elevation') {
+        Plotly.update(demPlot, {
+            surfacecolor: [dem.data],
+            colorscale: 'Earth',
+            cmin: [0],
+            cmax: [3000],
+            colorbar: {
+                title: 'Elevation (m)'
+            },
+            lighting: resetLighting,
+        });
+    }
+    if (selectedVariable === 'slopeAspect') {
+        Plotly.update(demPlot, {
+            surfacecolor: [simData[selectedVariable]],
+            // colorscale: cyclicAspectColorscale,
+            cmin: [0],
+            cmax: [360],
+            colorbar: {
+                title: 'Aspect (°)'
+            },
+            lighting: [resetLighting],
+        }, [0]);
+    } else if (selectedVariable === 'cellCount') {
+        const transformedSurfaceColor = simData[selectedVariable].map(row =>
+            row.map(val => Math.log10(val))
+        );
+        Plotly.update(demPlot, {
+            surfacecolor: [transformedSurfaceColor],
+            colorscale: ['Portland'],
+            cmin: [null],                               // reset min
+            cmax: [null],                               // reset max
+            colorbar: {
+                title: plotVariable.options[plotVariable.selectedIndex].text
+            },
+            lighting: [resetLighting],
+        }, {
+            'scene.colorbar.title.text': 'Log10(Cell Count)',
+            'scene.colorbar.title.font.color': 'red'
+        }[0]);
+
+        traceHist.x = simData[selectedVariable].flat().filter(val => val > 0).map(val => Math.log10(val));
+    } else if (selectedVariable === 'velocityField') {
+        traceHist.x = simData[selectedVariable].flat().filter(val => val > 0)
+    }
+
+    Plotly.react(histogramPlot, [traceHist], layoutHist);
+}
+
+function plotGpx(gpx) {
+    const webMercatorCoords = gpx.map(pt => latLonToWebMercator(pt.lat, pt.lon)).map(pt => dem.interpolateElevation(pt));
+
+    dem.interpolateElevation(webMercatorCoords[0])
+    const lineTrace = {
+        type: 'scatter3d',
+        mode: 'line+markers',
+        x: webMercatorCoords.map(pt => pt.x),
+        y: webMercatorCoords.map(pt => pt.y),
+        z: webMercatorCoords.map(pt => pt.z || 3000),
+        marker: {
+            size: 3,
         },
-        xaxis: {
-            title: 'X',
-            titlefont: { color: '#bbb' },
-            gridcolor: '#aaa',
-            tickfont: { color: '#ccc' }
-        },
-        yaxis: {
-            title: 'Y',
-            titlefont: { color: '#bbb' },
-            gridcolor: '#aaa',
-            tickfont: { color: '#ccc' }
-        }
-    },
-    margin: { l: 0, r: 0, b: 0, t: 0 },
-    paper_bgcolor: '#111',
-};
+        name: 'Route'
+    };
 
-const layout2d = {
-    title: 'Simulation Output',
-    template: 'plotly_dark',
-    autosize: true,
-    xaxis: {
-        title: 'Position X',
-        titlefont: { color: '#bbb' },
-        gridcolor: '#aaa',
-        tickfont: { color: '#ccc' },
-        zeroline: false,
-    },
-    yaxis: {
-        title: 'Parameter',
-        titlefont: { color: '#bbb' },
-        gridcolor: '#aaa',
-        tickfont: { color: '#ccc' },
-        zeroline: false,
-    },
-    legend: {
-        font: {
-            color: '#fff',  // Bright white text
-        },
-        bgcolor: 'rgba(0,0,0,0)',  // Transparent background (optional)
-        bordercolor: '#444',       // Optional border
-        borderwidth: 0
-    },
-    margin: { l: 40, r: 10, b: 40, t: 40 },
-    paper_bgcolor: '#111',
-    plot_bgcolor: '#111',
-};
-
+    Plotly.addTraces(demPlot, [lineTrace]);
+}
 
 function plotPosition() {
     const lineTrace = {
@@ -128,6 +177,7 @@ function plotPosition() {
         // If the plotDiv.data is undefined, we can skip the deletion
         console.warn('demPlot.data is undefined, skipping trace deletion.');
     }
+
     Plotly.addTraces(demPlot, [lineTrace]);
 }
 
@@ -256,34 +306,34 @@ function plotOutput() {
         name: 'Step Distance',
         // visible: 'legendonly',
     };
-    let layout = { ...layout2d };
-    layout.font = { color: 'white' };
-    layout.template = 'plotly_dark';
-    layout.updatemenus = [{
-        buttons: [
-            {
-                method: 'restyle',
-                args: ['x', [simData.travelDistance]],
-                label: 'Travel Distance [m]'
-            },
-            {
-                method: 'restyle',
-                args: ['x', [simData.time]],
-                label: 'Time [s]'
-            },
-            {
-                method: 'restyle',
-                args: ['x', [Array.from({ length: n }, (_, i) => i)]],
-                label: 'Timestep [#]'
-            }
-        ],
-        direction: 'up',
-        showactive: true,
-        x: 1,
-        xanchor: 'right',
-        y: 0,
-        yanchor: 'top',
-    }];
+    let layout = {
+        template: plotly_dark,
+        updatemenus: [{
+            buttons: [
+                {
+                    method: 'restyle',
+                    args: ['x', [simData.travelDistance]],
+                    label: 'Travel Distance [m]'
+                },
+                {
+                    method: 'restyle',
+                    args: ['x', [simData.time]],
+                    label: 'Time [s]'
+                },
+                {
+                    method: 'restyle',
+                    args: ['x', [Array.from({ length: n }, (_, i) => i)]],
+                    label: 'Timestep [#]'
+                }
+            ],
+            direction: 'up',
+            showactive: true,
+            x: 1,
+            xanchor: 'right',
+            y: 0,
+            yanchor: 'top',
+        }]
+    };
 
     const traces = [
         friction,
@@ -316,8 +366,6 @@ function plotOutput() {
         }
     });
 }
-const outputPlot = document.getElementById('outputPlot');
-const demPlot = document.getElementById('demPlot');
 
 function restoreTraceVisibility(plotElement, traces) {
     const saved = localStorage.getItem('traceVisibility');
@@ -334,6 +382,7 @@ function restoreTraceVisibility(plotElement, traces) {
         console.warn('Saved trace visibility does not match number of traces. Skipping restore.');
     }
 }
+
 
 function plotReleasePointsRGBA(releasePoints, width, height) {
     const slabMap = [];
@@ -389,8 +438,81 @@ function plotTimer() {
         yaxis: {
             title: "Milliseconds",
             zeroline: false
-        }
+        },
+        template: plotly_dark,
     };
 
     Plotly.newPlot("timerPlot", data, layout);
 }
+
+function plotHistogram() {
+    const data = [{
+        x: simData.roughness.flat().filter(v => v > 0), // Flatten and filter out zero values
+        type: 'histogram',
+        // xbins: {
+        //   size: 1  // Optional: bin width
+        // }
+    }];
+
+    var layout = {
+        // ...layout2d,
+        title: 'Histogram Example',
+        xaxis: { title: 'Value' },
+        yaxis: { title: 'Count' },
+        template: plotly_dark,
+    };
+
+    Plotly.newPlot('histogramPlot', data, layout);
+}
+
+function plotDebug(gpx) {
+
+    const webMercatorCoords = gpx.map(pt => latLonToWebMercator(pt.lat, pt.lon)).map(pt => dem.interpolateElevation(pt));
+
+    const trace = {
+        x: webMercatorCoords.map(pt => pt.x),
+        y: webMercatorCoords.map(pt => pt.y),
+        mode: 'markers', // or 'lines' or 'lines+markers'
+        type: 'scatter',
+        marker: {
+            color: 'red',
+            size: 8
+        },
+        name: 'Data Points'
+    };
+
+    const layout = {
+        title: '2D Scatter Plot',
+        xaxis: {
+            title: 'X Axis',
+            autorange: 'reversed',
+            scaleanchor: 'y'
+        },
+        yaxis: {
+            title: 'Y Axis',
+            autorange: 'reversed',
+            scaleratio: 1,
+        }
+    };
+    const bbox = {
+        x: [dem.bounds.xmin, dem.bounds.xmax, dem.bounds.xmax, dem.bounds.xmin, dem.bounds.xmin],
+        y: [dem.bounds.ymin, dem.bounds.ymin, dem.bounds.ymax, dem.bounds.ymax, dem.bounds.ymin],
+        mode: 'lines', // or 'lines' or 'lines+markers'
+        type: 'scatter',
+
+    }
+    const xmin = {
+        x: [dem.bounds.xmin, dem.bounds.xmin],
+        y: [dem.bounds.ymin, dem.bounds.ymax],
+        mode: 'markers',
+        type: 'scatter',
+        marker: {
+            color: 'blue',
+            size: 8
+        },
+        name: 'xmin'
+    }
+
+    Plotly.newPlot('debugPlot', [trace, bbox, xmin], layout);
+}
+// plotDebug();
