@@ -47,8 +47,11 @@ demDropdown.addEventListener('change', async (event) => {
     const selectedFile = event.target.value;
     localStorage.setItem('demDropdown', selectedFile);
     await dem.loadPNGAsFloat32(selectedFile);
-    plotDem(dem);
-    await runAndPlot();
+    plotDem(dem); 
+    await fetchInputs();
+    if (!isMobileDevice) {
+        runAndPlot();
+    }    
 });
 
 frictionModelDropdown.addEventListener('change', (event) => {
@@ -77,12 +80,14 @@ runButton.addEventListener('click', async () => {
 
 async function runAndPlot() {
     console.log('Run simulation');
-    await fetchInputs();
     await run(simSettings, dem, release_point);
     plotOutput();
     plotPosition();
-    plotTimer();
     plotHistogram();
+    simTimer.checkpoint('plotting');
+    plotTimer();
+    plotVariable.value = 'cellCount';
+    plotVariable.dispatchEvent(new Event('change'));
 }
 
 plotVariable = document.getElementById('plotVariable');
@@ -179,22 +184,17 @@ async function main() {
     // await getSettings();
     await fetchInputs();
     
-    // await dem.loadPNGAsFloat32(simSettings.casename);
-    const gpxString = await fetch('gpx/NockspitzeNDirectTop.gpx').then(response => response.text());
-    gpx = parseGPX(gpxString);
-    await dem.loadTiles(gpx, zoom = zoomLevelSlider.value)
+    await dem.loadPNGAsFloat32(simSettings.casename);
+    // const gpxString = await fetch('gpx/NockspitzeNDirectTop.gpx').then(response => response.text());
+    // gpx = parseGPX(gpxString);
+    // await dem.loadTiles(gpx, zoom = zoomLevelSlider.value)
     console.log("dem width:", dem.bounds.width, "height:", dem.bounds.height);
     plotDem(dem); // Initial plot
-    plotGpx(gpx); // Initial plot
+    // plotGpx(gpx); // Initial plot
     
     // await computeNormalsFromDemTexture(settings, dem);
     if (!isMobileDevice) {
-        run(simSettings, dem, release_point).then(() => {
-            plotOutput();
-            plotPosition();
-            plotTimer();
-            plotHistogram();
-        });
+        runAndPlot();
     }    
 }
 

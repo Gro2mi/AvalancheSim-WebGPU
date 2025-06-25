@@ -68,6 +68,18 @@ function updatePlots(selectedVariable) {
         title: `Histogram of ${selectedVariable}`,
         template: plotly_dark,
     };
+
+        Plotly.update(demPlot, {
+            surfacecolor: [simData[selectedVariable]],  // new data
+            cmin: [null],                               // reset min
+            cmax: [null],                               // reset max
+            colorscale: ['Portland'],
+            colorbar: {
+                title: plotVariable.options[plotVariable.selectedIndex].text
+            },
+            lighting: resetLighting,
+
+        });
     if (selectedVariable === 'elevation') {
         Plotly.update(demPlot, {
             surfacecolor: [dem.data],
@@ -110,19 +122,8 @@ function updatePlots(selectedVariable) {
         }[0]);
 
         traceHist.x = simData[selectedVariable].flat().filter(val => val > 0).map(val => Math.log10(val));
-    } else {
-        Plotly.update(demPlot, {
-            surfacecolor: [simData[selectedVariable]],  // new data
-            cmin: [null],                               // reset min
-            cmax: [null],                               // reset max
-            colorscale: ['Portland'],
-            colorbar: {
-                title: plotVariable.options[plotVariable.selectedIndex].text
-            },
-            lighting: resetLighting,
-
-        });
-
+    } else if (selectedVariable === 'velocityField') {
+        traceHist.x = simData[selectedVariable].flat().filter(val => val > 0)
     }
 
     Plotly.react(histogramPlot, [traceHist], layoutHist);

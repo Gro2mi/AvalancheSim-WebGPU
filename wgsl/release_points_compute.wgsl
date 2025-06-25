@@ -45,7 +45,7 @@ fn should_paint(pos: vec2u) -> bool {
 }
 
 fn get_roughness(id: vec2u) -> f32 {
-    // according to /16/2211/2016/ doi:10.5194/nhess-16-2211-2016
+    // according to doi:10.5194/nhess-16-2211-2016
     if (id.x == 0 || id.y == 0 || id.x >= textureDimensions(normals_texture).x - 1 || id.y >= textureDimensions(normals_texture).y - 1) {
         return 1.0; // no roughness at borders
     }
@@ -93,8 +93,8 @@ fn computeMain(@builtin(global_invocation_id) id: vec3<u32>) {
         || roughness > roughness_threshold
     ) {
         // slope angle in rad, roughness scaled with 50, aspect from [-1, 1] to [0, 1]
-        textureStore(release_points_texture, tex_pos, vec4f(slope_angle / 90.0, roughness * 50, (aspect + PI) / (2.0 * PI), 0));
+        textureStore(release_points_texture, tex_pos, vec4f(slope_angle / 90.0, roughness * 25, (aspect + PI) / (2.0 * PI), 0));
     } else {
-        textureStore(release_points_texture, tex_pos, vec4f(slope_angle / 90.0, roughness * 50, (aspect + PI)/ (2.0 * PI), settings.slab_thickness / 2.55));
+        textureStore(release_points_texture, tex_pos, vec4f(slope_angle / 90.0, roughness * 25, (aspect + PI)/ (2.0 * PI), settings.slab_thickness / 2.55));
     }
 }

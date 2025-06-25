@@ -242,7 +242,7 @@ class SimData {
     parseReleasePointTexture(releasePoints) {
         this.releaseSlabThickness = nullifyDomainBorder(to2DArray([...releasePoints].filter((_, index) => (index + 1) % 4 === 0).map((value, i) => (dem.data1d[i] > 0.1 ? value : null)), dem.width, dem.height));
         this.slopeAspect = nullifyDomainBorder(to2DArray([...releasePoints].filter((_, index) => (index + 2) % 4 === 0).map((value, i) => (dem.data1d[i] > 0.1 ? ((value / 255 * 360) + 180) % 360 : null)), dem.width, dem.height));
-        this.roughness = nullifyDomainBorder(to2DArray([...releasePoints].filter((_, index) => (index + 3) % 4 === 0).map((value, i) => dem.data1d[i] > 0.1 ? value / 50 / 255 : null), dem.width, dem.height));
+        this.roughness = nullifyDomainBorder(to2DArray([...releasePoints].filter((_, index) => (index + 3) % 4 === 0).map((value, i) => dem.data1d[i] > 0.1 ? value / 25 / 255 : null), dem.width, dem.height));
         this.slopeAngle = nullifyDomainBorder(to2DArray([...releasePoints].filter((_, index) => (index + 0) % 4 === 0).map((value, i) => dem.data1d[i] > 0.1 ? (value / 255 * 90) : null), dem.width, dem.height));
     }
     parseVelocityTexture(velocityTexture) {
