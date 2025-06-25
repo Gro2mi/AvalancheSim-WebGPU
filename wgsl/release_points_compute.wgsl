@@ -30,6 +30,7 @@
 //  ASAP! saves 3 byte per texel (75%) immediately, could optimize further (just 3 bit per texel for current impl)
 @group(0) @binding(3) var release_points_texture: texture_storage_2d<rgba8unorm, write>; // ASSERT: same dimensions as heights_texture
 
+const RAD_TO_DEG: f32 = 180.0 / 3.14159265358979323846;
 struct ReleasePointSettings {
     min_slope_angle: f32, // in rad
     max_slope_angle: f32, // in rad
@@ -80,9 +81,9 @@ fn computeMain(@builtin(global_invocation_id) id: vec3<u32>) {
         return;
     }
     let tex_pos = id.xy;
-    let normal = textureLoad(normals_texture, tex_pos, 0).xyz * 2 - 1;
+    let normal = (textureLoad(normals_texture, tex_pos, 0).xyz - 0.5) * 2.0;
     let elevation = textureLoad(dem_texture, tex_pos, 0).x;
-    let slope_angle = acos(normal.z); // slope angle in rad (0 flat, pi/2 vertical)
+    let slope_angle = acos(normal.z) * RAD_TO_DEG;
     let aspect = atan2(normal.x, normal.y);
     let roughness = get_roughness(tex_pos);
 
@@ -92,8 +93,8 @@ fn computeMain(@builtin(global_invocation_id) id: vec3<u32>) {
         || roughness > roughness_threshold
     ) {
         // slope angle in rad, roughness scaled with 50, aspect from [-1, 1] to [0, 1]
-        textureStore(release_points_texture, tex_pos, vec4f(slope_angle, roughness * 50, aspect / 2.0 + 0.5, 0));
+        textureStore(release_points_texture, tex_pos, vec4f(slope_angle / 90.0, roughness * 50, (aspect + PI) / (2.0 * PI), 0));
     } else {
-        textureStore(release_points_texture, tex_pos, vec4f(slope_angle, roughness * 50, aspect / 2.0 + 0.5, settings.slab_thickness / 2.55));
+        textureStore(release_points_texture, tex_pos, vec4f(slope_angle / 90.0, roughness * 50, (aspect + PI)/ (2.0 * PI), settings.slab_thickness / 2.55));
     }
 }

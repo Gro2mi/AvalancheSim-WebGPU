@@ -18,6 +18,11 @@ struct Settings {
   boundary: Boundary,
 };
 
+struct AtomicData {
+    counter: atomic<u32>,
+};
+
+
 
 struct Point2 {
   x: f32,
@@ -56,6 +61,9 @@ struct TimestepData {
 
 @group(0) @binding(9) var<storage, read_write> output_texture_buffer: array<atomic<u32>>; // trajectory texture
 @group(0) @binding(10) var<storage, read_write> output_velocity_texture_buffer: array<atomic<u32>>; // trajectory texture
+
+@group(0) @binding(11)
+var<storage, read_write> atomicBuffer: AtomicData;
 
 const g: f32 = 9.81;
 const density: f32 = 200.0;
@@ -182,8 +190,9 @@ fn computeMain(@builtin(global_invocation_id) cell: vec3<u32>) {
     if (centroid_cell.x == cell.x && centroid_cell.y == cell.y) {
         sim_info.step_count = step_count;
     }
-    out_debug[0] = last.normal.x;
-    out_debug[1] = last.normal.y;
+    atomicAdd(&atomicBuffer.counter, step_count);
+    out_debug[0] = last.position.x;
+    out_debug[1] = last.position.y;
     out_debug[2] = last.uv.x;
     out_debug[3] = last.uv.y;
     out_debug[4] = get_elevation(last.uv);
@@ -276,7 +285,6 @@ fn get_elevation(uv: vec2f) -> f32 {
 
 fn get_normal(uv: vec2f) -> vec3f {
     var normal = textureSampleLevel(normals_texture, tex_sampler, uv, 0).xyz * 2 - 1; // convert from [0, 1] to [-1, 1]
-    normal.y = -normal.y; // flip y-axis to match the coordinate system
     return normal;
 }
 
