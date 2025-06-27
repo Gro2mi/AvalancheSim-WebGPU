@@ -96,8 +96,8 @@ function updatePlots(selectedVariable) {
         Plotly.update(demPlot, {
             surfacecolor: [simData[selectedVariable]],
             // colorscale: cyclicAspectColorscale,
-            cmin: [0],
-            cmax: [360],
+            // cmin: [0],
+            // cmax: [360],
             colorbar: {
                 title: 'Aspect (°)'
             },
@@ -159,7 +159,7 @@ function plotPosition() {
         marker: {
             size: 3,
             color: simData.velocityMagnitude,
-            colorscale: 'Hot',
+            colorscale: 'Bluered',
             cmin: Math.min(...simData.velocityMagnitude),
             cmax: Math.max(...simData.velocityMagnitude),
         },

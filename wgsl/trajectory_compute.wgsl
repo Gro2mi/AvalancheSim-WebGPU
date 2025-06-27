@@ -34,6 +34,10 @@ struct SimInfo {
   dxy_min: f32,
 };
 
+struct TimestepDataArray {
+  trajectories: array<TimestepData, 3>,
+};
+
 struct TimestepData {
     velocity: vec3f,                        // 12 bytes     12
     dt: f32,                          //  4 bytes     16
@@ -56,7 +60,7 @@ struct TimestepData {
 @group(0) @binding(5) var tex_sampler: sampler;
 
 @group(0) @binding(6) var<storage, read_write> sim_info: SimInfo;
-@group(0) @binding(7) var<storage, read_write> out_buffer: array<TimestepData>;
+@group(0) @binding(7) var<storage, read_write> out_timestep_data: array<TimestepDataArray>; // trajectory data, fixed size 3
 @group(0) @binding(8) var<storage, read_write> out_debug: array<f32>;
 
 @group(0) @binding(9) var<storage, read_write> output_texture_buffer: array<atomic<u32>>; // trajectory texture
@@ -156,13 +160,13 @@ fn computeMain(@builtin(global_invocation_id) cell: vec3<u32>) {
     // bigger than 1.0 because it's in the divisor later
     last.dt = sqrt(settings.cfl * dxy_min / length(last.acceleration_tangential)) * 1.1;
     if (centroid_cell.x == cell.x && centroid_cell.y == cell.y) {
-        update_output_data(0u, last);
+        update_output_data(0u, 0u, last);
     }
     var step_count: u32 = 0u;
     for (var i: u32 = 0u; i < settings.num_steps; i++) {
         let current: TimestepData = compute_timestep(last, dxy_min);
         if (centroid_cell.x == cell.x && centroid_cell.y == cell.y) {
-            update_output_data(i + 1u, current);
+            update_output_data(0u, i + 1u, current);
         }
         // if(uv_to_cell_index(current.uv) != uv_to_cell_index(last.uv)) {
         // }
@@ -228,8 +232,8 @@ fn compute_timestep(last: TimestepData, dxy_min: f32) -> TimestepData {
         return current;
 }
 
-fn update_output_data(i: u32, timestep_data: TimestepData) {
-    out_buffer[i] = timestep_data;
+fn update_output_data(trajectory: u32, timestep: u32, timestep_data: TimestepData) {
+    out_timestep_data[timestep].trajectories[trajectory] = timestep_data;
 }
 
 fn acceleration_by_friction(acceleration_normal: vec3f, mass_per_area: f32, velocity: vec3f) -> f32 {
@@ -284,7 +288,7 @@ fn get_elevation(uv: vec2f) -> f32 {
 }
 
 fn get_normal(uv: vec2f) -> vec3f {
-    var normal = textureSampleLevel(normals_texture, tex_sampler, uv, 0).xyz * 2 - 1; // convert from [0, 1] to [-1, 1]
+    var normal = textureSampleLevel(normals_texture, tex_sampler, uv, 0).xyz; // convert from [0, 1] to [-1, 1]
     return normal;
 }
 

@@ -81,7 +81,8 @@ fn computeMain(@builtin(global_invocation_id) id: vec3<u32>) {
         return;
     }
     let tex_pos = id.xy;
-    let normal = (textureLoad(normals_texture, tex_pos, 0).xyz - 0.5) * 2.0;
+    let normal_compute = textureLoad(normals_texture, tex_pos, 0);
+    let normal = normal_compute.xyz;
     let elevation = textureLoad(dem_texture, tex_pos, 0).x;
     let slope_angle = acos(normal.z) * RAD_TO_DEG;
     let aspect = atan2(normal.x, normal.y);

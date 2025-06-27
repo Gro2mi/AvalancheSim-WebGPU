@@ -47,11 +47,11 @@ demDropdown.addEventListener('change', async (event) => {
     const selectedFile = event.target.value;
     localStorage.setItem('demDropdown', selectedFile);
     await dem.loadPNGAsFloat32(selectedFile);
-    plotDem(dem); 
+    plotDem(dem);
     await fetchInputs();
     if (!isMobileDevice) {
         runAndPlot();
-    }    
+    }
 });
 
 frictionModelDropdown.addEventListener('change', (event) => {
@@ -73,13 +73,37 @@ function changeFrictionModel() {
         dragCoefficientSlider.disabled = false;
     }
 }
+function setSettingsDisabled(flag) {
+    const controls = document.querySelectorAll('#simSettingsDiv input, #simSettingsDiv select, #simSettingsDiv textarea, #simSettingsDiv button');
+    controls.forEach(el => el.disabled = flag);
+    runButton.disabled = flag;
+    prepareButton.disabled = flag;
+    changeFrictionModel();
+    if (flag) {
+        runButton.textContent = "Running...";
+    } else {
+        runButton.textContent = "Run Simulation";
+    }
+}
+
+// Disable all
+
+// Enable all
+const simSettingsDiv = document.getElementById('simSettingsDiv')
 const runButton = document.getElementById('runSimulation')
+const prepareButton = document.getElementById('prepareSimulation')
 runButton.addEventListener('click', async () => {
     await runAndPlot();
+});
+prepareButton.addEventListener('click', async () => {
+    await run(simSettings, dem, release_point);
+    plotVariable.value = 'slopeAspect';
+    plotVariable.dispatchEvent(new Event('change'));
 });
 
 async function runAndPlot() {
     console.log('Run simulation');
+    setSettingsDisabled(true);
     await run(simSettings, dem, release_point);
     plotOutput();
     plotPosition();
@@ -88,6 +112,7 @@ async function runAndPlot() {
     plotTimer();
     plotVariable.value = 'cellCount';
     plotVariable.dispatchEvent(new Event('change'));
+    setSettingsDisabled(false);
 }
 
 plotVariable = document.getElementById('plotVariable');
@@ -183,7 +208,7 @@ async function main() {
     changeFrictionModel();
     // await getSettings();
     await fetchInputs();
-    
+
     await dem.loadPNGAsFloat32(simSettings.casename);
     // const gpxString = await fetch('gpx/NockspitzeNDirectTop.gpx').then(response => response.text());
     // gpx = parseGPX(gpxString);
@@ -191,11 +216,11 @@ async function main() {
     console.log("dem width:", dem.bounds.width, "height:", dem.bounds.height);
     plotDem(dem); // Initial plot
     // plotGpx(gpx); // Initial plot
-    
+
     // await computeNormalsFromDemTexture(settings, dem);
     if (!isMobileDevice) {
         runAndPlot();
-    }    
+    }
 }
 
 

@@ -44,7 +44,7 @@ class Shader {
     this.pipeline = device.createComputePipeline({
       label: this.name + " Compute Pipeline",
       layout: 'auto',
-      compute: { module: this.module, entryPoint: 'computeMain' },
+      compute: { module: this.module, entryPoint: 'computeMain', },
     });
     return this.pipeline;
   }
@@ -97,24 +97,20 @@ class Shaders {
   async fetch() {
     // TODO: implement include functionality for WGSL
     this.shaderImports.code = await loadAndConcatShaders([
-      "wgsl/util/tile_util.wgsl",
-      "wgsl/util/normals_util.wgsl",
-      "wgsl/util/tile_hashmap.wgsl",
-      "wgsl/util/filtering.wgsl",
-      'wgsl/util/color_mapping.wgsl'
+      "wgsl/random.wgsl",
     ]);
     await this.shaderImports.compile();
     this.linesImported = countLines(this.shaderImports.code);
 
     this.normals.code = await loadAndConcatShaders(['wgsl/normals_compute.wgsl']);
-    this.releasePoints.code = this.shaderImports.code + await loadAndConcatShaders(['wgsl/release_points_compute.wgsl']);
+    this.releasePoints.code = await loadAndConcatShaders(['wgsl/release_points_compute.wgsl']);
     this.trajectory.code = await loadAndConcatShaders(['wgsl/trajectory_compute.wgsl']);
   }
 
   async compile() {
     // await this.decodeDem.compile();
     await this.normals.compile();
-    await this.releasePoints.compile(this.linesImported);
+    await this.releasePoints.compile();
     await this.trajectory.compile();
   }
 
@@ -137,6 +133,8 @@ var shaders = new Shaders();
 
 
 async function run(simSettings, dem, release_point) {
+  // TODO: currently only works with 3 which is enough for test cases
+  const TRACKED_TRAJECTORIES = 3;
   simTimer = new Timer("Avalanche Simulation")
   // only load shaders if not already loaded or in debug mode
   if (debug || shaders.normals.code == null) {
@@ -241,7 +239,7 @@ async function run(simSettings, dem, release_point) {
   const outputVelocityTextureBuffer = createStorageBuffer(device, outputTextureSize);
 
   // Create all output buffers
-  const simDataBufferSize = SimData.timeStepByteSize * simSettings.maxSteps;
+  const simDataBufferSize = TRACKED_TRAJECTORIES * SimData.timeStepByteSize * simSettings.maxSteps;
   const simInfoBuffer = createStorageBuffer(device, SimInfo.byteSize);
   const outBuffer = createStorageBuffer(device, simDataBufferSize);
   const outDebug = createStorageBuffer(device, 4 * 100);
@@ -288,7 +286,7 @@ async function run(simSettings, dem, release_point) {
   await device.queue.onSubmittedWorkDone();
   // Copy outputs to readback buffers
   commandEncoder.copyBufferToBuffer(simInfoBuffer, 0, readbackSimInfo, 0, SimInfo.byteSize);
-  commandEncoder.copyBufferToBuffer(outBuffer, 0, readbackSimData, 0, maxSteps * SimData.timeStepByteSize);
+  commandEncoder.copyBufferToBuffer(outBuffer, 0, readbackSimData, 0, simDataBufferSize);
   commandEncoder.copyBufferToBuffer(outputTextureBuffer, 0, readbackOutputTexture, 0, outputTextureSize);
   commandEncoder.copyBufferToBuffer(outputVelocityTextureBuffer, 0, readbackVelocityTexture, 0, outputTextureSize);
   commandEncoder.copyBufferToBuffer(outAtomicBuffer, 0, readbackAtomicBuffer, 0, 4);
@@ -334,7 +332,7 @@ async function run(simSettings, dem, release_point) {
   console.log("Step count: ", simInfo.stepCount);
   console.log("dxy min: ", simInfo.dxyMin);
   // Read results
-  const bufferSimData = await readBuffer(readbackSimData, simInfo.stepCount * SimData.timeStepByteSize, Float32Array);
+  const bufferSimData = await readBuffer(readbackSimData, simDataBufferSize, Float32Array);
   const bufferOutputTexture = await readBuffer(readbackOutputTexture, outputTextureSize, Uint32Array);
   const bufferVelocityTexture = await readBuffer(readbackVelocityTexture, outputTextureSize, Uint32Array);
   const totalTimesteps = await readBuffer(readbackAtomicBuffer, 4, Uint32Array);
@@ -375,7 +373,7 @@ async function run(simSettings, dem, release_point) {
 
   simTimer.checkpoint("readback textures");
   simData = new SimData(simInfo.dxyMin);
-  simData.parse(bufferSimData, simInfo.stepCount);
+  simData.parse(bufferSimData, simInfo.stepCount, TRACKED_TRAJECTORIES);
 
   console.log([...bufferSimData.slice(0, 16)]); // Log first 16 floats for debugging
   simTimer.printSummary();

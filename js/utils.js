@@ -241,7 +241,9 @@ class SimData {
 
     parseReleasePointTexture(releasePoints) {
         this.releaseSlabThickness = nullifyDomainBorder(to2DArray([...releasePoints].filter((_, index) => (index + 1) % 4 === 0).map((value, i) => (dem.data1d[i] > 0.1 ? value : null)), dem.width, dem.height));
-        this.slopeAspect = nullifyDomainBorder(to2DArray([...releasePoints].filter((_, index) => (index + 2) % 4 === 0).map((value, i) => (dem.data1d[i] > 0.1 ? ((value / 255 * 360) + 180) % 360 : null)), dem.width, dem.height));
+        // this.slopeAspect = nullifyDomainBorder(to2DArray([...releasePoints].filter((_, index) => (index + 2) % 4 === 0).map((value, i) => (dem.data1d[i] > 0.1 ? ((value / 255 * 360) + 180) % 360 : null)), dem.width, dem.height));
+        // curvature
+        this.slopeAspect = nullifyDomainBorder(to2DArray([...releasePoints].filter((_, index) => (index + 2) % 4 === 0).map((value, i) => (dem.data1d[i] > 0.1 ? value : null)), dem.width, dem.height));
         this.roughness = nullifyDomainBorder(to2DArray([...releasePoints].filter((_, index) => (index + 3) % 4 === 0).map((value, i) => dem.data1d[i] > 0.1 ? value / 25 / 255 : null), dem.width, dem.height));
         this.slopeAngle = nullifyDomainBorder(to2DArray([...releasePoints].filter((_, index) => (index + 0) % 4 === 0).map((value, i) => dem.data1d[i] > 0.1 ? (value / 255 * 90) : null), dem.width, dem.height));
     }
@@ -265,9 +267,9 @@ class SimData {
         this.uv.x.push(uv.x);
         this.uv.y.push(uv.y);
     }
-    parse(bufferData, nTimesteps) {
+    parse(bufferData, nTimesteps, numberTrackedTrajectories) {
         for (let i = 0; i < nTimesteps; i++) {
-            let baseOffset = i * SimData.timeStepByteSize / 4;
+            let baseOffset = numberTrackedTrajectories * i * SimData.timeStepByteSize / 4;
             this.addData(bufferData, baseOffset);
         }
     }
@@ -321,9 +323,10 @@ function countLines(str) {
 }
 
 function max(arr) {
+    arr = arr.flat();
     let max = -Infinity;
     for (let i = 0; i < arr.length; i++) {
-        if (arr[i] > max) {
+        if (arr[i] > max && arr[i] !== null && arr[i] !== undefined) {
             max = arr[i];
         }
     }
@@ -331,9 +334,10 @@ function max(arr) {
 }
 
 function min(arr) {
+    arr = arr.flat();
     let min = Infinity;
     for (let i = 0; i < arr.length; i++) {
-        if (arr[i] < min) {
+        if (arr[i] < min && arr[i] !== null && arr[i] !== undefined) {
             min = arr[i];
         }
     }
@@ -344,9 +348,12 @@ function mean(arr) {
     if (arr.length === 0) {
         throw new Error("Cannot calculate mean of an empty array");
     }
+    arr = arr.flat();
     let sum = 0;
     for (let i = 0; i < arr.length; i++) {
-        sum += arr[i];
+        if (arr[i] !== null || arr[i] !== undefined) {
+            sum += arr[i];
+        }
     }
     return sum / arr.length;
 }
