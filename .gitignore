@@ -5,3 +5,4 @@ wgsl/test.wgsl
 forest_data/
 forestDataCLC/
 *.pem
+lawis/data/
