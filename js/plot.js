@@ -1,6 +1,7 @@
 const outputPlot = document.getElementById('outputPlot');
 const demPlot = document.getElementById('demPlot');
 const histogramPlot = document.getElementById('histogramPlot');
+    
 const resetLighting = {
     ambient: 0.8,
     diffuse: 0.8,
@@ -46,6 +47,16 @@ async function plotDem(dem) {
             }
         };
         Plotly.newPlot('demPlot', data, layout);
+        demPlot.on('plotly_click', function(eventData) {
+                const point = eventData.points[0];
+                const i = point.pointNumber[0]; // column index (x)
+                const j = point.pointNumber[1]; // row index (y)
+                const x = point.x;
+                const y = point.y;
+                const z = point.z;
+
+                console.log(`Clicked surface point at i=${i}, j=${j}, x=${x}, y=${y}, z=${z}`);
+            });
     } catch (error) {
         console.error('Error loading or plotting data:', error);
     }
@@ -58,28 +69,6 @@ const cyclicAspectColorscale = [
     [1.0, 'blue']      // 360° North again to close the loop
 ];
 function updatePlots(selectedVariable) {
-    var traceHist = {
-        type: 'histogram',
-        x: simData[selectedVariable].flat(),
-        autobinx: true, // or set fixed bin settings
-    };
-
-    const layoutHist = {
-        title: `Histogram of ${selectedVariable}`,
-        template: plotly_dark,
-    };
-
-        Plotly.update(demPlot, {
-            surfacecolor: [simData[selectedVariable]],  // new data
-            cmin: [null],                               // reset min
-            cmax: [null],                               // reset max
-            colorscale: ['Portland'],
-            colorbar: {
-                title: plotVariable.options[plotVariable.selectedIndex].text
-            },
-            lighting: resetLighting,
-
-        });
     if (selectedVariable === 'elevation') {
         Plotly.update(demPlot, {
             surfacecolor: [dem.data],
@@ -91,18 +80,42 @@ function updatePlots(selectedVariable) {
             },
             lighting: resetLighting,
         });
+        return;
     }
+    var traceHist = {
+        type: 'histogram',
+        x: simData[selectedVariable].flat(),
+        autobinx: true, // or set fixed bin settings
+    };
+
+    const layoutHist = {
+        title: `Histogram of ${selectedVariable}`,
+        template: plotly_dark,
+    };
+        Plotly.update(demPlot, {
+            surfacecolor: [simData[selectedVariable]],  // new data
+            cmin: [null],                               // reset min
+            cmax: [null],                               // reset max
+            colorscale: ['Portland'],
+            colorbar: {
+                title: plotVariable.options[plotVariable.selectedIndex].text
+            },
+            lighting: resetLighting,
+
+        });
     if (selectedVariable === 'slopeAspect') {
         Plotly.update(demPlot, {
             surfacecolor: [simData[selectedVariable]],
             // colorscale: cyclicAspectColorscale,
-            cmin: [0],
-            cmax: [360],
+            cmin: [null],
+            cmax: [null],
             colorbar: {
                 title: 'Aspect (°)'
             },
             lighting: [resetLighting],
         }, [0]);
+
+        traceHist.x = simData[selectedVariable].flat().filter((val, index) => (Math.abs(val) < 1) && (dem.data1d[index] > 0));
     } else if (selectedVariable === 'cellCount') {
         const transformedSurfaceColor = simData[selectedVariable].map(row =>
             row.map(val => Math.log10(val))
@@ -159,7 +172,7 @@ function plotPosition() {
         marker: {
             size: 3,
             color: simData.velocityMagnitude,
-            colorscale: 'Hot',
+            colorscale: 'Bluered',
             cmin: Math.min(...simData.velocityMagnitude),
             cmax: Math.max(...simData.velocityMagnitude),
         },
