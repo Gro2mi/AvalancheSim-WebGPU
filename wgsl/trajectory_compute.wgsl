@@ -212,6 +212,7 @@ fn compute_timestep(last: TimestepData, dxy_min: f32) -> TimestepData {
         let normal_and_curvature = get_normal_and_curvature(last.uv); 
         current.normal = normal_and_curvature.xyz;
         let profile_curvature = normal_and_curvature.w;
+        current.acceleration_normal = g * current.normal.z * current.normal;
         current.acceleration_tangential = acceleration_gravity + current.acceleration_normal;
         // avoid division by zero with velocity_threshold
         current.dt = settings.cfl * dxy_min / (length(last.velocity + current.acceleration_tangential * last.dt) + velocity_threshold);
