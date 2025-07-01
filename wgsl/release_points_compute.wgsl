@@ -1,47 +1,24 @@
-// /*****************************************************************************
-//  * weBIGeo
-//  * Copyright (C) 2024 Adam Celarek
-//  * Copyright (C) 2024 Patrick Komon
-//  *
-//  * This program is free software: you can redistribute it and/or modify
-//  * it under the terms of the GNU General Public License as published by
-//  * the Free Software Foundation, either version 3 of the License, or
-//  * (at your option) any later version.
-//  *
-//  * This program is distributed in the hope that it will be useful,
-//  * but WITHOUT ANY WARRANTY; without even the implied warranty of
-//  * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-//  * GNU General Public License for more details.
-//  *
-//  * You should have received a copy of the GNU General Public License
-//  * along with this program.  If not, see <http://www.gnu.org/licenses/>.
-//  *****************************************************************************/
-
-// #include "util/normals_util.wgsl"
-// #include "util/color_mapping.wgsl"
-// input
 @group(0) @binding(0) var<uniform> settings: ReleasePointSettings;
 @group(0) @binding(1) var dem_texture: texture_2d<f32>;
 @group(0) @binding(2) var normals_texture: texture_2d<f32>;
+// @group(0) @binding(2) var landcover_texture: texture_2d<u32>;
 
-// output
-//currently, format r8uint cannot be used for storage texture with write access (apparently only 32 bit formats can be used)
-//TODO use storage buffer instead for now!
-//  ASAP! saves 3 byte per texel (75%) immediately, could optimize further (just 3 bit per texel for current impl)
-@group(0) @binding(3) var release_points_texture: texture_storage_2d<rgba8unorm, write>; // ASSERT: same dimensions as heights_texture
+@group(0) @binding(3) var release_points_texture: texture_storage_2d<rgba16float, write>;
+@group(0) @binding(4) var<storage, read_write> out_debug: array<f32>;
 
-const RAD_TO_DEG: f32 = 180.0 / 3.14159265358979323846;
+const PI: f32 = 3.14159265358979323846;
+const RAD_TO_DEG: f32 = 180.0 / PI;
+
+const confers_trees = vec4u(34, 139, 34, 255);
+const broadleaf_deciduous_trees = vec4u(128, 255, 0, 255);
+const broadleaf_evergreen_trees = vec4u(0, 255, 8, 255);
+
 struct ReleasePointSettings {
     min_slope_angle: f32, // in rad
     max_slope_angle: f32, // in rad
     min_elevation: f32, // in meters
     slab_thickness: f32, // in meters
     // sampling_interval: vec2u,
-}
-
-fn should_paint(pos: vec2u) -> bool {
-    // return (pos.x % settings.sampling_interval.x == 0) && (pos.y % settings.sampling_interval.y == 0);
-    return true;
 }
 
 fn get_roughness(id: vec2u) -> f32 {
@@ -72,6 +49,17 @@ fn get_roughness(id: vec2u) -> f32 {
     return roughness; // returns 0 for flat terrain, 1 for very rough terrain
 }
 
+// fn is_forest(id: vec2u) -> bool {
+//     // check if the pixel is within the bounds of the landcover texture
+//     if (id.x >= textureDimensions(landcover_texture).x || id.y >= textureDimensions(landcover_texture).y) {
+//         return false;
+//     }
+//     // load the landcover value at the given id
+//     let landcover_value = textureLoad(landcover_texture, id, 0).r; // assuming landcover is stored in the red channel
+//     // check if the value corresponds to forest (e.g., 1.0 for forest)
+//     return landcover_value > 0.5; // adjust threshold as needed
+// }
+
 @compute @workgroup_size(16, 16, 1)
 fn computeMain(@builtin(global_invocation_id) id: vec3<u32>) {
     let roughness_threshold = 0.01;  // TODO is this high enough?
@@ -83,19 +71,21 @@ fn computeMain(@builtin(global_invocation_id) id: vec3<u32>) {
     let tex_pos = id.xy;
     let normal_compute = textureLoad(normals_texture, tex_pos, 0);
     let normal = normal_compute.xyz;
+    let profile_curvature = normal_compute.w;
     let elevation = textureLoad(dem_texture, tex_pos, 0).x;
     let slope_angle = acos(normal.z) * RAD_TO_DEG;
     let aspect = atan2(normal.x, normal.y);
     let roughness = get_roughness(tex_pos);
 
     if (slope_angle < settings.min_slope_angle || slope_angle > settings.max_slope_angle 
-        || !should_paint(tex_pos)
         || elevation < settings.min_elevation
         || roughness > roughness_threshold
     ) {
         // slope angle in rad, roughness scaled with 50, aspect from [-1, 1] to [0, 1]
-        textureStore(release_points_texture, tex_pos, vec4f(slope_angle / 90.0, roughness * 25, (aspect + PI) / (2.0 * PI), 0));
+        textureStore(release_points_texture, tex_pos, vec4f(slope_angle, roughness, aspect, 0));
     } else {
-        textureStore(release_points_texture, tex_pos, vec4f(slope_angle / 90.0, roughness * 25, (aspect + PI)/ (2.0 * PI), settings.slab_thickness / 2.55));
+        textureStore(release_points_texture, tex_pos, vec4f(slope_angle, roughness, aspect, settings.slab_thickness));
     }
+    // needs to stay here, otherwise texture is not used
+    out_debug[0] = f32(slope_angle);
 }

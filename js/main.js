@@ -44,6 +44,7 @@ zoomLevelSlider.addEventListener('change', () => {
 });
 
 demDropdown.addEventListener('change', async (event) => {
+    predefinedReleasePoints = true;
     const selectedFile = event.target.value;
     localStorage.setItem('demDropdown', selectedFile);
     await dem.loadPNGAsFloat32(selectedFile);
@@ -96,7 +97,7 @@ runButton.addEventListener('click', async () => {
     await runAndPlot();
 });
 prepareButton.addEventListener('click', async () => {
-    await run(simSettings, dem, release_point);
+    await run(simSettings, dem, release_point, predefinedReleasePoints);
     plotVariable.value = 'slopeAspect';
     plotVariable.dispatchEvent(new Event('change'));
 });
@@ -104,14 +105,18 @@ prepareButton.addEventListener('click', async () => {
 async function runAndPlot() {
     console.log('Run simulation');
     setSettingsDisabled(true);
-    await run(simSettings, dem, release_point);
-    plotOutput();
-    plotPosition();
-    plotHistogram();
-    simTimer.checkpoint('plotting');
-    plotTimer();
-    plotVariable.value = 'cellCount';
-    plotVariable.dispatchEvent(new Event('change'));
+    try {
+        await run(simSettings, dem, release_point, predefinedReleasePoints);
+        plotOutput();
+        plotPosition();
+        plotHistogram();
+        simTimer.checkpoint('plotting');
+        plotTimer();
+        plotVariable.value = 'cellCount';
+        plotVariable.dispatchEvent(new Event('change'));
+    } catch (error) {
+        console.error('Error during simulation:', error);
+    }
     setSettingsDisabled(false);
 }
 
@@ -155,12 +160,6 @@ async function getSettings() {
     )
 }
 
-async function loadReleasePoints(casename) {
-    const response = await fetch('dem/' + casename + '.rp');  // Path to your JSON file
-    const jsonData = await response.json();
-    return jsonData;
-}
-
 async function fetchInputs() {
     await getSettings();
     release_points = await loadReleasePoints(simSettings.casename);
@@ -181,17 +180,18 @@ async function main() {
         alert("WebGPU is not supported or failed to initialize. Please use a compatible browser like Chrome.");
         runButton.disabled = true;
         runButton.textContent = "WebGPU not supported";
-    } else if (!adapter.features.has("float32-filterable")) {
-        alert("Your device has to support float32-filterable textures to run this.");
+    } else if (!adapter.features.has("float32-filterable") || (debug && !adapter.features.has("timestamp-query"))) {
+        alert("Your device has to support float32-filterable textures and timestamp-query to run this simulation.");
         runButton.disabled = true;
-        runButton.textContent = "WebGPU not supported";
+        runButton.textContent = "WebGPU features not supported";
     } else {
         console.log("Adapter limits:", adapter.limits);
+        console.log("Adapter features:", [...adapter.features]);
         const maxInvocations = adapter.limits.maxComputeInvocationsPerWorkgroup;
         const workgroupSizeXY = Math.floor(Math.sqrt(maxInvocations));
         console.log("Release point:", release_point);
         device = await adapter.requestDevice({
-            requiredFeatures: ["float32-filterable"],
+            requiredFeatures: ["float32-filterable", 'timestamp-query'],
             requiredLimits: {
                 maxComputeWorkgroupSizeX: workgroupSizeXY,
                 maxComputeWorkgroupSizeY: workgroupSizeXY,
@@ -216,7 +216,6 @@ async function main() {
     console.log("dem width:", dem.bounds.width, "height:", dem.bounds.height);
     plotDem(dem); // Initial plot
     // plotGpx(gpx); // Initial plot
-
     // await computeNormalsFromDemTexture(settings, dem);
     if (!isMobileDevice) {
         runAndPlot();
@@ -227,6 +226,7 @@ async function main() {
 var gpx;
 var tiles = [];
 document.getElementById("gpxfile").addEventListener("change", async (e) => {
+    predefinedReleasePoints = false;
     const file = e.target.files[0];
     if (!file) return;
 
@@ -234,12 +234,16 @@ document.getElementById("gpxfile").addEventListener("change", async (e) => {
     tiles = [];
     gpx = parseGPX(gpxString);
     await dem.loadTiles(gpx, zoom = zoomLevelSlider.value)
+
     plotDem(dem);
     plotGpx(gpx);
-
+    if (!isMobileDevice) {
+        runAndPlot();
+    }
 });
 
 debug = false;
+let predefinedReleasePoints = true;
 const urlParams = new URLSearchParams(window.location.search);
 if (urlParams.get("debug") === "vscode") {
     debug = true;

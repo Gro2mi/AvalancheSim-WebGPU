@@ -95,8 +95,7 @@ fn cell_coords_to_index(cell: vec2u) -> u32 {
 
 
 fn get_release_point_slab_thickness(cell: vec2u) -> f32 {
-    let mask = textureLoad(release_points_texture, cell, 0).rgba;
-    return mask.a;
+    return textureLoad(release_points_texture, cell, 0).a / 100;
 }
 
 fn uv_to_cell_coords(uv: vec2f) -> vec2u {
@@ -194,8 +193,8 @@ fn computeMain(@builtin(global_invocation_id) cell: vec3<u32>) {
     if (centroid_cell.x == cell.x && centroid_cell.y == cell.y) {
         sim_info.step_count = step_count;
     }
-    atomicAdd(&atomicBuffer.counter, step_count);
-    out_debug[0] = last.position.x;
+    atomicMax(&atomicBuffer.counter, step_count);
+    out_debug[0] = slab_thickness;
     out_debug[1] = last.position.y;
     out_debug[2] = last.uv.x;
     out_debug[3] = last.uv.y;
@@ -205,14 +204,14 @@ fn computeMain(@builtin(global_invocation_id) cell: vec3<u32>) {
     out_debug[8] = settings.boundary.y_min;
     out_debug[9] = settings.boundary.x_max;
     out_debug[10] = settings.boundary.y_max;
-
 }
 
 
 fn compute_timestep(last: TimestepData, dxy_min: f32) -> TimestepData {
         var current: TimestepData;
-        current.normal = get_normal(last.uv); 
-        current.acceleration_normal = g * current.normal.z * current.normal;
+        let normal_and_curvature = get_normal_and_curvature(last.uv); 
+        current.normal = normal_and_curvature.xyz;
+        let profile_curvature = normal_and_curvature.w;
         current.acceleration_tangential = acceleration_gravity + current.acceleration_normal;
         // avoid division by zero with velocity_threshold
         current.dt = settings.cfl * dxy_min / (length(last.velocity + current.acceleration_tangential * last.dt) + velocity_threshold);
@@ -287,9 +286,12 @@ fn get_elevation(uv: vec2f) -> f32 {
     return textureSampleLevel(dem_texture, tex_sampler, uv, 0).x;
 }
 
+fn get_normal_and_curvature(uv: vec2f) -> vec4f {
+    return textureSampleLevel(normals_texture, tex_sampler, uv, 0); // convert from [0, 1] to [-1, 1
+}
+
 fn get_normal(uv: vec2f) -> vec3f {
-    var normal = textureSampleLevel(normals_texture, tex_sampler, uv, 0).xyz; // convert from [0, 1] to [-1, 1]
-    return normal;
+    return get_normal_and_curvature(uv).xyz; // convert from [0, 1] to [-1, 1
 }
 
 fn world_to_uv(world_pos: vec2f) -> vec2f {
