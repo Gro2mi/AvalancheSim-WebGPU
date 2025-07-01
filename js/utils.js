@@ -13,15 +13,9 @@ class Dem {
     }
 
     async loadPNGAsFloat32(casename) {
-        const response = await fetch('dem/' + casename + '.png');
-        const buffer = await response.arrayBuffer();
-
-        // Decode PNG to raw RGBA bytes
-        const img = UPNG.decode(buffer);
-        const rgba = new Uint8Array(UPNG.toRGBA8(img)[0]); // RGBA Uint8 bytes
-
-        this.width = img.width;
-        this.height = img.height;
+        const { rgba, width, height } = await loadPNG('avaframe/' + casename + '.png');
+        this.width = width;
+        this.height = height;
         this.data1d = new Float32Array(this.width * this.height);
 
         const temp = new ArrayBuffer(4);
@@ -239,11 +233,22 @@ class SimData {
         this.velocityField = [];
     }
 
-    parseReleasePointTexture(releasePoints) {
-        this.releaseSlabThickness = nullifyDomainBorder(to2DArray([...releasePoints].filter((_, index) => (index + 1) % 4 === 0).map((value, i) => (dem.data1d[i] > 0.1 ? value : null)), dem.width, dem.height));
-        this.slopeAspect = nullifyDomainBorder(to2DArray([...releasePoints].filter((_, index) => (index + 2) % 4 === 0).map((value, i) => (dem.data1d[i] > 0.1 ? ((value / 255 * 360) + 180) % 360 : null)), dem.width, dem.height));
-        this.roughness = nullifyDomainBorder(to2DArray([...releasePoints].filter((_, index) => (index + 3) % 4 === 0).map((value, i) => dem.data1d[i] > 0.1 ? value / 25 / 255 : null), dem.width, dem.height));
-        this.slopeAngle = nullifyDomainBorder(to2DArray([...releasePoints].filter((_, index) => (index + 0) % 4 === 0).map((value, i) => dem.data1d[i] > 0.1 ? (value / 255 * 90) : null), dem.width, dem.height));
+    cleanFloatArray(data) {
+        return nullifyDomainBorder(data.map((row, y) =>
+            row.map((value, x) => (dem.data[y][x] > 0.1 ? value : null))
+        ), dem.height, dem.width).map(row => Array.from(row));;
+    }
+
+    //   releasePoints = transposeAndTo2DArray(releasePoints, dem.width, dem.height);
+    parseReleasePointTexture(r, g, b, a) {
+        this.slopeAngle = this.cleanFloatArray(r);
+        this.roughness = this.cleanFloatArray(g);
+        this.slopeAspect = this.cleanFloatArray(b).map(
+            row => row.map(
+                value => ((360 + (value * 180 / Math.PI)) % 360)
+            )
+        );
+        this.releaseSlabThickness = this.cleanFloatArray(a);
     }
     parseVelocityTexture(velocityTexture) {
         this.velocityField = to2DArray(velocityTexture, dem.width, dem.height).map(typedArr => Array.from(typedArr));
@@ -265,9 +270,9 @@ class SimData {
         this.uv.x.push(uv.x);
         this.uv.y.push(uv.y);
     }
-    parse(bufferData, nTimesteps) {
+    parse(bufferData, nTimesteps, numberTrackedTrajectories) {
         for (let i = 0; i < nTimesteps; i++) {
-            let baseOffset = i * SimData.timeStepByteSize / 4;
+            let baseOffset = numberTrackedTrajectories * i * SimData.timeStepByteSize / 4;
             this.addData(bufferData, baseOffset);
         }
     }
@@ -321,9 +326,10 @@ function countLines(str) {
 }
 
 function max(arr) {
+    arr = arr.flatMap(row => Array.from(row));
     let max = -Infinity;
     for (let i = 0; i < arr.length; i++) {
-        if (arr[i] > max) {
+        if (arr[i] > max && arr[i] !== null && arr[i] !== undefined && arr[i] !== NaN) {
             max = arr[i];
         }
     }
@@ -331,9 +337,10 @@ function max(arr) {
 }
 
 function min(arr) {
+    arr = arr.flatMap(row => Array.from(row));
     let min = Infinity;
     for (let i = 0; i < arr.length; i++) {
-        if (arr[i] < min) {
+        if (arr[i] < min && arr[i] !== null && arr[i] !== undefined && arr[i] !== NaN) {
             min = arr[i];
         }
     }
@@ -341,12 +348,15 @@ function min(arr) {
 }
 
 function mean(arr) {
+    arr = arr.flatMap(row => Array.from(row));
     if (arr.length === 0) {
         throw new Error("Cannot calculate mean of an empty array");
     }
     let sum = 0;
     for (let i = 0; i < arr.length; i++) {
-        sum += arr[i];
+        if (arr[i] !== null || arr[i] !== undefined && arr[i] !== NaN) {
+            sum += arr[i];
+        }
     }
     return sum / arr.length;
 }
@@ -385,35 +395,27 @@ async function loadDemBinary(url, width, height) {
 }
 
 async function loadDemJson(casename) {
-    const response = await fetch('dem/' + casename + '.json');  // Path to your JSON file
+    const response = await fetch('avaframe/' + casename + '.json');  // Path to your JSON file
+const jsonData = await response.json();
+    return jsonData;
+}
+
+async function loadReleasePoints(casename) {
+    const response = await fetch('avaframe/' + casename + '.rp');  // Path to your JSON file
     const jsonData = await response.json();
     return jsonData;
 }
 
-async function loadPNGAsFloat32(casename) {
-    const response = await fetch('dem/' + casename + '.png');
+async function loadPNG(url) {
+    const response = await fetch(url);
     const buffer = await response.arrayBuffer();
 
     // Decode PNG to raw RGBA bytes
     const img = UPNG.decode(buffer);
     const width = img.width;
     const height = img.height;
-    const rgba = new Uint8Array(UPNG.toRGBA8(img)[0]); // RGBA Uint8 bytes
-
-    const arr1d = new Float32Array(width * height);
-    const temp = new ArrayBuffer(4);
-    const view = new DataView(temp);
-
-    for (let i = 0; i < width * height; i++) {
-        const offset = i * 4;
-        view.setUint8(0, rgba[offset]);
-        view.setUint8(1, rgba[offset + 1]);
-        view.setUint8(2, rgba[offset + 2]);
-        view.setUint8(3, rgba[offset + 3]);
-        arr1d[i] = view.getFloat32(0, true); // little endian
-    }
-    console.log("Loaded PNG ", casename, ":", width, "x", height);
-    return { arr1d, width, height };
+    const rgba = new Uint8Array(UPNG.toRGBA8(img)[0]);
+    return { rgba, width, height };
 }
 function to2DArray(arr1D, width, height) {
     if (arr1D.length !== width * height) {
@@ -435,7 +437,7 @@ function linspace(start, end, num) {
 }
 
 async function fetchBounds(casename) {
-    const res = await fetch('dem/' + casename + '.aabb');
+    const res = await fetch('avaframe/' + casename + '.aabb');
     const text = await res.text();
 
     // Split by line, filter non-empty, parse as float
@@ -622,4 +624,34 @@ function bilinearInterpolate(x, y, grid) {
     const r2 = q12 * (1 - fx) + q22 * fx;
 
     return r1 * (1 - fy) + r2 * fy;
+}
+
+function decodeFloat16(bits) {
+    const s = (bits & 0x8000) >> 15;       // sign
+    const e = (bits & 0x7C00) >> 10;       // exponent
+    const f = bits & 0x03FF;               // fraction
+
+    if (e === 0) {
+        // Subnormal
+        return (s ? -1 : 1) * Math.pow(2, -14) * (f / Math.pow(2, 10));
+    }
+    if (e === 0x1F) {
+        // Inf or NaN
+        return f === 0 ? (s ? -Infinity : Infinity) : NaN;
+    }
+
+    // Normalized
+    return (s ? -1 : 1) * Math.pow(2, e - 15) * (1 + f / Math.pow(2, 10));
+}
+
+function flipFlatArrayInY(src, width, height) {
+    const rowSize = width * 4 * src.constructor.BYTES_PER_ELEMENT; // 4 bytes per pixel (RGBA)
+    const flipped = new src.constructor(src.length);
+
+    for (let y = 0; y < height; y++) {
+        const srcOffset = y * rowSize;
+        const dstOffset = (height - 1 - y) * rowSize;
+        flipped.set(src.subarray(srcOffset, srcOffset + rowSize), dstOffset);
+    }
+    return flipped;
 }

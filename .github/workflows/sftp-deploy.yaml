@@ -25,4 +25,5 @@ jobs:
             --exclude-glob .github/ \
             --exclude-glob '*.md' \
             --exclude-glob '*.json' \
+            --exclude-glob 'data/' \
           "
