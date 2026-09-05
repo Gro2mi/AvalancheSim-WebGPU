@@ -655,6 +655,45 @@ impl PySimulation {
         Ok(stopped.to_pyarray(py))
     }
 
+    #[getter]
+    fn get_center_of_mass_x<'py>(
+        &mut self,
+        py: Python<'py>,
+    ) -> PyResult<Bound<'py, PyArray1<f32>>> {
+        let (x, _, _) = self
+            .inner
+            .get_center_of_mass()
+            .block_on()
+            .map_runtime_err()?;
+        Ok(x.to_pyarray(py))
+    }
+
+    #[getter]
+    fn get_center_of_mass_y<'py>(
+        &mut self,
+        py: Python<'py>,
+    ) -> PyResult<Bound<'py, PyArray1<f32>>> {
+        let (_, y, _) = self
+            .inner
+            .get_center_of_mass()
+            .block_on()
+            .map_runtime_err()?;
+        Ok(y.to_pyarray(py))
+    }
+
+    #[getter]
+    fn get_center_of_mass_z<'py>(
+        &mut self,
+        py: Python<'py>,
+    ) -> PyResult<Bound<'py, PyArray1<f32>>> {
+        let (_, _, z) = self
+            .inner
+            .get_center_of_mass()
+            .block_on()
+            .map_runtime_err()?;
+        Ok(z.to_pyarray(py))
+    }
+
     fn convert_rgba_texture<'py>(
         &self,
         py: Python<'py>,

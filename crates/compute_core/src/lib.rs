@@ -1,18 +1,22 @@
 use crate::buffers::{
-    AtomicValues, BufferName, GpuResources, TextureName, create_buffers_and_texture_descriptions,
+    AtomicValues, BufferName, CenterOfMassResult, ChamferDistanceResult, ChamferParams,
+    GpuResources, TextureName, create_buffers_and_texture_descriptions,
 };
+use crate::settings::SimModel;
 use crate::shaders::{ComputeShaderConfig, ShaderName, generate_shader_report};
 use crate::utils::timer_checkpoint;
 use anyhow::{Context, Result, anyhow};
-use evaluation::{MassMovementEvaluation, evaluation_from_counts};
+use evaluation::{
+    ChamferDistance, MassMovementEvaluation, chamfer_from_sums, evaluation_from_counts,
+};
 use std::cmp::min;
 use std::collections::HashMap;
 use std::hash::Hash;
 use std::mem::size_of;
 use wgpu::{
-    Adapter, BufferUsages, CommandEncoderDescriptor, ComputePassDescriptor, Device,
-    DeviceDescriptor, Extent3d, Features, Instance, InstanceDescriptor, Limits, PowerPreference,
-    Queue, RequestAdapterOptions, TextureFormat, TextureUsages,
+    Adapter, BindGroup, BufferUsages, CommandEncoderDescriptor, ComputePassDescriptor,
+    ComputePipeline, Device, DeviceDescriptor, Extent3d, Features, Instance, InstanceDescriptor,
+    Limits, PowerPreference, Queue, RequestAdapterOptions, TextureFormat, TextureUsages,
 };
 
 // use log::{debug, info, warn, error};
@@ -108,6 +112,7 @@ pub struct GpuCache {
     pub roughness: Option<Vec<f32>>,
     pub release_areas: Option<Vec<f32>>,
     pub timestep_data: Option<TimestepData>,
+    pub center_of_mass: Option<Vec<CenterOfMassResult>>,
     pub read_count: usize,
 }
 
@@ -122,6 +127,7 @@ impl GpuCache {
         self.peak_velocity = None;
         self.timestep_data = None;
         self.peak_flow_thickness = None;
+        self.center_of_mass = None;
     }
 
     pub fn reset_all(&mut self) {
@@ -184,6 +190,25 @@ pub struct TimestepDataAoS {
     pub _pad1: [f32; 1],                      // 4 bytes
     pub uv: [f32; 2],                         // 8 bytes
     pub _pad2: [f32; 2],                      // 8 bytes (padding to 96 bytes)
+}
+
+impl Default for TimestepDataAoS {
+    fn default() -> Self {
+        Self {
+            velocity: [f32::NAN; 3],
+            dt: f32::NAN,
+            acceleration_tangential: [f32::NAN; 3],
+            acceleration_friction_magnitude: f32::NAN,
+            position: [f32::NAN; 3],
+            elevation: f32::NAN,
+            normal: [f32::NAN; 3],
+            g_eff: f32::NAN,
+            acceleration_normal: [f32::NAN; 3],
+            _pad1: [0.0; 1],
+            uv: [f32::NAN; 2],
+            _pad2: [0.0; 2],
+        }
+    }
 }
 
 const _: () = assert!(std::mem::size_of::<TimestepDataAoS>() == 96);
@@ -369,6 +394,24 @@ pub async fn list_devices() -> Result<Vec<String>> {
 
 const WORKGROUP_SIZE_2D: u32 = 16;
 
+struct SimulationPipelines {
+    reset_grid: ComputePipeline,
+    p2g: ComputePipeline,
+    grid_physics: ComputePipeline,
+    particle_update: ComputePipeline,
+    update_sim_info: ComputePipeline,
+    center_of_mass: ComputePipeline,
+}
+
+struct SimulationBindGroups {
+    reset_grid: BindGroup,
+    p2g: BindGroup,
+    grid_physics: BindGroup,
+    particle_update: BindGroup,
+    update_sim_info: BindGroup,
+    center_of_mass: BindGroup,
+}
+
 fn ordered_u32_to_f32(ordered: u32) -> f32 {
     let bits = if ordered & 0x8000_0000 != 0 {
         ordered ^ 0x8000_0000
@@ -395,7 +438,10 @@ pub struct ComputeOrchestrator {
     dispatch_number_workgroups_y_2d: u32,
     dispatch_number_workgroups_1d: u32,
     prepared_max_steps: Option<u32>,
+    completed_steps: u32,
     prepared_model: Option<u32>,
+    simulation_pipelines: Option<SimulationPipelines>,
+    simulation_bind_groups: Option<SimulationBindGroups>,
     has_float32_filterable: bool,
     has_float32_atomic: bool,
 }
@@ -616,7 +662,7 @@ impl ComputeOrchestrator {
                     max_storage_buffer_binding_size,
                     max_buffer_size,
                     max_storage_buffers_per_shader_stage: min(
-                        13,
+                        14,
                         limits.max_storage_buffers_per_shader_stage,
                     ),
                     ..Limits::default()
@@ -658,9 +704,12 @@ impl ComputeOrchestrator {
             dispatch_number_workgroups_1d: 0,
             prepared_max_steps: None,
             prepared_model: None,
+            simulation_pipelines: None,
+            simulation_bind_groups: None,
             has_float32_filterable,
             batch_compute_steps: 200,
             has_float32_atomic,
+            completed_steps: 0,
         })
     }
 
@@ -740,6 +789,8 @@ impl ComputeOrchestrator {
         &mut self,
         sim_settings: &settings::SimSettings,
     ) -> Result<()> {
+        self.simulation_pipelines = None;
+        self.simulation_bind_groups = None;
         self.texture_size = Extent3d {
             width: sim_settings.grid_shape_x,
             height: sim_settings.grid_shape_y,
@@ -782,6 +833,9 @@ impl ComputeOrchestrator {
             height: sim_settings.grid_shape_y,
             depth_or_array_layers: 1,
         };
+
+        self.simulation_pipelines = None;
+        self.simulation_bind_groups = None;
 
         self.dispatch_number_workgroups_x_2d =
             sim_settings.grid_shape_x.div_ceil(WORKGROUP_SIZE_2D);
@@ -888,6 +942,168 @@ impl ComputeOrchestrator {
             .number_release_cells;
 
         Ok(number_release_cells)
+    }
+
+    /// Computes the center of mass of the grid mass buffer on the GPU.
+    ///
+    /// The shader runs as a single workgroup with a strided loop, so the
+    /// dispatch size does not depend on the grid shape. The result `com` is
+    /// in world coordinates, `total_mass` in the decoded grid mass unit.
+    pub async fn run_compute_center_of_mass(
+        &mut self,
+        sim_settings: &settings::SimSettings,
+    ) -> Result<CenterOfMassResult> {
+        if sim_settings.grid_shape_x == 0 || sim_settings.grid_shape_y == 0 {
+            return Err(anyhow!("Grid must not be empty"));
+        }
+        self.resources.write_buffer(
+            &self.queue,
+            BufferName::SimSettings,
+            sim_settings.as_bytes(),
+        )?;
+        self.run_shader(&ShaderName::ComputeCenterOfMass, 1, 1, 1)
+            .await?;
+        let result = self
+            .read_buffer::<CenterOfMassResult>(BufferName::CenterOfMass)
+            .await?;
+        result
+            .first()
+            .copied()
+            .ok_or_else(|| anyhow!("CenterOfMass buffer was empty"))
+    }
+
+    /// Computes the diagonal-normalized chamfer distance between the simulated
+    /// cells (`grid_peak_flow_thickness > peak_flow_thickness_threshold`) and
+    /// the region-of-interest bitmask on the GPU.
+    ///
+    /// Seeds two nearest-neighbor fields, propagates the nearest seeds with the
+    /// jump flooding algorithm (one dispatch per power-of-two step size), and
+    /// reduces the distances in a single workgroup. The result distances are
+    /// normalized by the length of the grid diagonal in world units.
+    pub async fn run_compute_chamfer_distance(
+        &mut self,
+        sim_settings: &settings::SimSettings,
+    ) -> Result<ChamferDistance> {
+        if sim_settings.grid_shape_x == 0 || sim_settings.grid_shape_y == 0 {
+            return Err(anyhow!("Grid must not be empty"));
+        }
+        let cell_count = usize::try_from(sim_settings.grid_shape_x)
+            .ok()
+            .and_then(|width| {
+                usize::try_from(sim_settings.grid_shape_y)
+                    .ok()
+                    .and_then(|height| width.checked_mul(height))
+            })
+            .ok_or_else(|| anyhow!("Grid buffer size overflow"))?;
+        let nearest_bytes = cell_count * size_of::<[u32; 2]>();
+        let nearest_usage = BufferUsages::STORAGE | BufferUsages::COPY_SRC | BufferUsages::COPY_DST;
+        // recreated on every call, so the fields always match the current grid size
+        self.add_buffer(BufferName::ChamferNearestRoi, nearest_bytes, nearest_usage);
+        self.add_buffer(
+            BufferName::ChamferNearestRoiSnapshot,
+            nearest_bytes,
+            nearest_usage,
+        );
+        self.add_buffer(BufferName::ChamferNearestSim, nearest_bytes, nearest_usage);
+        self.add_buffer(
+            BufferName::ChamferNearestSimSnapshot,
+            nearest_bytes,
+            nearest_usage,
+        );
+        self.add_buffer(
+            BufferName::ChamferParams,
+            size_of::<ChamferParams>(),
+            BufferUsages::UNIFORM | BufferUsages::COPY_DST,
+        );
+        self.add_buffer(
+            BufferName::ChamferDistance,
+            size_of::<ChamferDistanceResult>(),
+            BufferUsages::STORAGE | BufferUsages::COPY_SRC,
+        );
+
+        self.resources.write_buffer(
+            &self.queue,
+            BufferName::SimSettings,
+            sim_settings.as_bytes(),
+        )?;
+
+        let dispatch_x = sim_settings.grid_shape_x.div_ceil(WORKGROUP_SIZE_2D);
+        let dispatch_y = sim_settings.grid_shape_y.div_ceil(WORKGROUP_SIZE_2D);
+        self.run_shader(&ShaderName::ChamferPrepare, dispatch_x, dispatch_y, 1)
+            .await?;
+
+        // jump flooding: steps n/2, n/4, ..., 1 with n the next power of two
+        // >= the larger grid dimension
+        let max_dimension = sim_settings.grid_shape_x.max(sim_settings.grid_shape_y);
+        let mut step = max_dimension.next_power_of_two() / 2;
+        if step == 0 {
+            step = 1;
+        }
+        loop {
+            self.copy_buffer(
+                BufferName::ChamferNearestRoi,
+                BufferName::ChamferNearestRoiSnapshot,
+            )?;
+            self.copy_buffer(
+                BufferName::ChamferNearestSim,
+                BufferName::ChamferNearestSimSnapshot,
+            )?;
+            self.write_buffer(
+                BufferName::ChamferParams,
+                &[ChamferParams {
+                    step,
+                    _padding: [0; 3],
+                }],
+            )
+            .await?;
+            self.run_shader(&ShaderName::ChamferFlood, dispatch_x, dispatch_y, 1)
+                .await?;
+            if step == 1 {
+                break;
+            }
+            step /= 2;
+        }
+
+        self.run_shader(&ShaderName::ChamferReduce, 1, 1, 1).await?;
+
+        let raw = self
+            .read_buffer::<ChamferDistanceResult>(BufferName::ChamferDistance)
+            .await?;
+        let raw = raw
+            .first()
+            .ok_or_else(|| anyhow!("ChamferDistance buffer was empty"))?;
+        let diagonal = (((sim_settings.grid_shape_x as f64) * (sim_settings.cell_size as f64))
+            .powi(2)
+            + ((sim_settings.grid_shape_y as f64) * (sim_settings.cell_size as f64)).powi(2))
+        .sqrt();
+        Ok(chamfer_from_sums(
+            raw.sum_sim_to_roi,
+            raw.count_sim,
+            raw.sum_roi_to_sim,
+            raw.count_roi,
+            diagonal,
+        ))
+    }
+
+    /// Copies the full contents of one named buffer into another on the GPU.
+    fn copy_buffer(&self, source: BufferName, destination: BufferName) -> Result<()> {
+        let source_buffer = self
+            .resources
+            .get_buffer(&source)
+            .ok_or_else(|| anyhow!("Buffer '{}' not found", source))?;
+        let destination_buffer = self
+            .resources
+            .get_buffer(&destination)
+            .ok_or_else(|| anyhow!("Buffer '{}' not found", destination))?;
+        let size = source_buffer.size().min(destination_buffer.size());
+        let mut encoder = self
+            .device
+            .create_command_encoder(&CommandEncoderDescriptor {
+                label: Some(&format!("Copy {} to {} Encoder", source, destination)),
+            });
+        encoder.copy_buffer_to_buffer(source_buffer, 0, destination_buffer, 0, size);
+        self.queue.submit(Some(encoder.finish()));
+        Ok(())
     }
 
     pub async fn evaluate_gpu(
@@ -1086,16 +1302,23 @@ impl ComputeOrchestrator {
                 "number_release_particles must be greater than zero"
             ));
         }
-        let timestep_count = usize::try_from(sim_settings.max_steps)
-            .context("max_steps does not fit in usize")?
+        let max_timesteps =
+            usize::try_from(sim_settings.max_steps).context("max_steps does not fit in usize")?;
+        let center_of_mass_buffer_bytes: Vec<CenterOfMassResult> =
+            vec![CenterOfMassResult::default(); max_timesteps];
+        self.add_buffer_with_data(
+            BufferName::CenterOfMass,
+            &center_of_mass_buffer_bytes,
+            BufferUsages::STORAGE | BufferUsages::COPY_DST | BufferUsages::COPY_SRC,
+        );
+
+        let timestep_buffer_count = max_timesteps
             .checked_mul(3)
             .ok_or_else(|| anyhow!("Timestep buffer size overflow"))?;
-        let timestep_bytes = timestep_count
-            .checked_mul(size_of::<TimestepDataAoS>())
-            .ok_or_else(|| anyhow!("Timestep buffer size overflow"))?;
-        self.add_buffer(
+        let timestep_buffer_bytes = vec![TimestepDataAoS::default(); timestep_buffer_count];
+        self.add_buffer_with_data(
             BufferName::TimestepData,
-            timestep_bytes,
+            &timestep_buffer_bytes,
             BufferUsages::STORAGE | BufferUsages::COPY_DST | BufferUsages::COPY_SRC,
         );
 
@@ -1119,6 +1342,71 @@ impl ComputeOrchestrator {
             sim_settings.as_bytes(),
         )?;
 
+        let (p2g_shader, grid_physics_shader, particle_update_shader) = match sim_settings.sim_model
+        {
+            0 => (
+                ShaderName::P2G,
+                ShaderName::GridPhysics,
+                ShaderName::ComputeParticles,
+            ),
+            1 => (
+                ShaderName::P2GMPM,
+                ShaderName::GridPhysicsMPM,
+                ShaderName::G2P,
+            ),
+            2_u32..=u32::MAX => {
+                return Err(anyhow!(
+                    "Unsupported simulation model: {}",
+                    sim_settings.sim_model
+                ));
+            }
+        };
+
+        let update_sim_info_config = self
+            .shader_configs
+            .get(&ShaderName::UpdateSimInfo)
+            .ok_or_else(|| anyhow!("UpdateSimInfo shader config not found"))?;
+        let p2g_config = self
+            .shader_configs
+            .get(&p2g_shader)
+            .ok_or_else(|| anyhow!("{} shader config not found", p2g_shader))?;
+        let grid_physics_config = self
+            .shader_configs
+            .get(&grid_physics_shader)
+            .ok_or_else(|| anyhow!("{} shader config not found", grid_physics_shader))?;
+        let particle_update_config = self
+            .shader_configs
+            .get(&particle_update_shader)
+            .ok_or_else(|| anyhow!("{} shader config not found", particle_update_shader))?;
+        let compute_center_of_mass_config = self
+            .shader_configs
+            .get(&ShaderName::ComputeCenterOfMass)
+            .ok_or_else(|| anyhow!("ComputeCenterOfMass shader config not found"))?;
+        let reset_grid_config = self
+            .shader_configs
+            .get(&ShaderName::ResetGrid)
+            .ok_or_else(|| anyhow!("ResetGrid shader config not found"))?;
+
+        self.simulation_pipelines = Some(SimulationPipelines {
+            reset_grid: reset_grid_config.pipeline.clone(),
+            p2g: p2g_config.pipeline.clone(),
+            grid_physics: grid_physics_config.pipeline.clone(),
+            particle_update: particle_update_config.pipeline.clone(),
+            update_sim_info: update_sim_info_config.pipeline.clone(),
+            center_of_mass: compute_center_of_mass_config.pipeline.clone(),
+        });
+        self.simulation_bind_groups = Some(SimulationBindGroups {
+            reset_grid: reset_grid_config.create_bind_group(&self.device, &self.resources)?,
+            p2g: p2g_config.create_bind_group(&self.device, &self.resources)?,
+            grid_physics: grid_physics_config.create_bind_group(&self.device, &self.resources)?,
+            particle_update: particle_update_config
+                .create_bind_group(&self.device, &self.resources)?,
+            update_sim_info: update_sim_info_config
+                .create_bind_group(&self.device, &self.resources)?,
+            center_of_mass: compute_center_of_mass_config
+                .create_bind_group(&self.device, &self.resources)?,
+        });
+
         self.prepared_max_steps = Some(sim_settings.max_steps);
         self.prepared_model = Some(sim_settings.sim_model);
         Ok(())
@@ -1138,84 +1426,37 @@ impl ComputeOrchestrator {
         .await
     }
 
-    async fn step_simulation(
-        &self,
-        steps: u32,
-        p2g_shader: ShaderName,
-        grid_physics_shader: ShaderName,
-        particle_update_shader: ShaderName,
-    ) -> Result<SimInfo> {
+    async fn step_simulation(&mut self, steps: u32, sim_model: SimModel) -> Result<SimInfo> {
         let prepared_model = self
             .prepared_model
             .ok_or_else(|| anyhow!("Simulation has not been prepared"))?;
-        let expected_model = match p2g_shader {
-            ShaderName::P2G => 0,
-            ShaderName::P2GMPM => 1,
-            _ => return Err(anyhow!("Invalid particle-to-grid shader: {p2g_shader}")),
-        };
-        if prepared_model != expected_model {
+        if prepared_model != sim_model.as_int() {
             return Err(anyhow!(
-                "Simulation was prepared for model {prepared_model}, not model {expected_model}"
+                "Simulation was prepared for model {prepared_model}, not model {sim_model}"
             ));
         }
-        let current_info = self
-            .read_buffer::<SimInfo>(BufferName::SimInfo)
-            .await?
-            .first()
-            .copied()
-            .ok_or_else(|| anyhow!("SimInfo buffer was empty"))?;
         let max_steps = self
             .prepared_max_steps
             .ok_or_else(|| anyhow!("Simulation has not been prepared"))?;
-        let completed_steps = current_info.timestep.saturating_sub(1);
-        let remaining_steps = max_steps.saturating_sub(completed_steps);
+        self.completed_steps = self.completed_steps.saturating_sub(1);
+        let remaining_steps = max_steps.saturating_sub(self.completed_steps);
         if steps > remaining_steps {
             return Err(anyhow!(
                 "Requested {steps} steps, but only {remaining_steps} steps remain"
             ));
         }
         if steps == 0 {
-            return Ok(current_info);
+            return self.get_sim_info().await;
         }
 
-        let update_sim_info_config = self
-            .shader_configs
-            .get(&ShaderName::UpdateSimInfo)
-            .ok_or_else(|| anyhow!("UpdateSimInfo shader config not found"))?;
-
-        let update_sim_info_bindgroup =
-            update_sim_info_config.create_bind_group(&self.device, &self.resources)?;
-
-        let p2g_config = self
-            .shader_configs
-            .get(&p2g_shader)
-            .ok_or_else(|| anyhow!("{} shader config not found", p2g_shader))?;
-
-        let p2g_bindgroup = p2g_config.create_bind_group(&self.device, &self.resources)?;
-
-        let grid_physics_config = self
-            .shader_configs
-            .get(&grid_physics_shader)
-            .ok_or_else(|| anyhow!("{} shader config not found", grid_physics_shader))?;
-
-        let grid_physics_bindgroup =
-            grid_physics_config.create_bind_group(&self.device, &self.resources)?;
-
-        let particle_update_config = self
-            .shader_configs
-            .get(&particle_update_shader)
-            .ok_or_else(|| anyhow!("{} shader config not found", particle_update_shader))?;
-
-        let particle_update_bindgroup =
-            particle_update_config.create_bind_group(&self.device, &self.resources)?;
-
-        let reset_grid_config = self
-            .shader_configs
-            .get(&ShaderName::ResetGrid)
-            .ok_or_else(|| anyhow!("ResetGrid shader config not found"))?;
-
-        let reset_grid_bind_group =
-            reset_grid_config.create_bind_group(&self.device, &self.resources)?;
+        let simulation_pipelines = self
+            .simulation_pipelines
+            .as_ref()
+            .ok_or_else(|| anyhow!("Simulation pipelines have not been prepared"))?;
+        let simulation_bind_groups = self
+            .simulation_bind_groups
+            .as_ref()
+            .ok_or_else(|| anyhow!("Simulation bind groups have not been prepared"))?;
 
         let mut command_encoder =
             self.device
@@ -1230,37 +1471,45 @@ impl ComputeOrchestrator {
                 });
 
             for _ in 0..steps {
-                compute_pass.set_pipeline(&reset_grid_config.pipeline);
-                compute_pass.set_bind_group(0, &reset_grid_bind_group, &[]);
+                compute_pass.set_pipeline(&simulation_pipelines.reset_grid);
+                compute_pass.set_bind_group(0, &simulation_bind_groups.reset_grid, &[]);
                 compute_pass.dispatch_workgroups(
                     self.dispatch_number_workgroups_x_2d,
                     self.dispatch_number_workgroups_y_2d,
                     1,
                 );
 
-                compute_pass.set_pipeline(&p2g_config.pipeline);
-                compute_pass.set_bind_group(0, &p2g_bindgroup, &[]);
+                compute_pass.set_pipeline(&simulation_pipelines.p2g);
+                compute_pass.set_bind_group(0, &simulation_bind_groups.p2g, &[]);
                 compute_pass.dispatch_workgroups(self.dispatch_number_workgroups_1d, 1, 1);
 
-                compute_pass.set_pipeline(&grid_physics_config.pipeline);
-                compute_pass.set_bind_group(0, &grid_physics_bindgroup, &[]);
+                compute_pass.set_pipeline(&simulation_pipelines.grid_physics);
+                compute_pass.set_bind_group(0, &simulation_bind_groups.grid_physics, &[]);
                 compute_pass.dispatch_workgroups(
                     self.dispatch_number_workgroups_x_2d,
                     self.dispatch_number_workgroups_y_2d,
                     1,
                 );
 
-                compute_pass.set_pipeline(&particle_update_config.pipeline);
-                compute_pass.set_bind_group(0, &particle_update_bindgroup, &[]);
+                compute_pass.set_pipeline(&simulation_pipelines.particle_update);
+                compute_pass.set_bind_group(0, &simulation_bind_groups.particle_update, &[]);
                 compute_pass.dispatch_workgroups(self.dispatch_number_workgroups_1d, 1, 1);
 
-                compute_pass.set_pipeline(&update_sim_info_config.pipeline);
-                compute_pass.set_bind_group(0, &update_sim_info_bindgroup, &[]);
+                compute_pass.set_pipeline(&simulation_pipelines.update_sim_info);
+                compute_pass.set_bind_group(0, &simulation_bind_groups.update_sim_info, &[]);
                 compute_pass.dispatch_workgroups(1, 1, 1);
+
+                compute_pass.set_pipeline(&simulation_pipelines.center_of_mass);
+                compute_pass.set_bind_group(0, &simulation_bind_groups.center_of_mass, &[]);
+                compute_pass.dispatch_workgroups(self.dispatch_number_workgroups_1d, 1, 1);
             }
         }
         self.queue.submit(Some(command_encoder.finish()));
 
+        self.get_sim_info().await
+    }
+
+    pub async fn get_sim_info(&mut self) -> Result<SimInfo> {
         self.read_buffer::<SimInfo>(BufferName::SimInfo)
             .await?
             .first()
@@ -1269,13 +1518,7 @@ impl ComputeOrchestrator {
     }
 
     pub async fn step_compute_particles(&mut self, steps: u32) -> Result<SimInfo> {
-        self.step_simulation(
-            steps,
-            ShaderName::P2G,
-            ShaderName::GridPhysics,
-            ShaderName::ComputeParticles,
-        )
-        .await
+        self.step_simulation(steps, SimModel::Particle).await
     }
 
     pub async fn run_compute_particles(
@@ -1383,13 +1626,7 @@ impl ComputeOrchestrator {
     }
 
     pub async fn step_mpm(&mut self, steps: u32) -> Result<SimInfo> {
-        self.step_simulation(
-            steps,
-            ShaderName::P2GMPM,
-            ShaderName::GridPhysicsMPM,
-            ShaderName::G2P,
-        )
-        .await
+        self.step_simulation(steps, SimModel::MPM).await
     }
 
     pub async fn run_mpm(
@@ -1651,6 +1888,163 @@ mod tests {
         let empty_simulation = block_on(orchestrator.evaluate_gpu(&settings))
             .expect("GPU evaluation without affected cells failed");
         assert_eq!(empty_simulation.beeline_distance_3d, 0.0);
+    }
+
+    #[test_log::test]
+    fn test_compute_center_of_mass() {
+        let settings = settings::SimSettings {
+            grid_shape_x: 3,
+            grid_shape_y: 2,
+            cell_size: 5.0,
+            ..Default::default()
+        };
+        let mut orchestrator =
+            block_on(ComputeOrchestrator::new()).expect("Failed to create ComputeOrchestrator");
+        orchestrator
+            .create_buffers_and_texture_descriptions(&settings)
+            .expect("Failed to create GPU resources");
+
+        // the shader binds sim_info, dem, sampler and atomic_values and writes
+        // to the slot sim_info.timestep - 2, so provide them here as
+        // prepare_simulation would
+        orchestrator.add_buffer_with_data(
+            BufferName::CenterOfMass,
+            &[CenterOfMassResult::default()],
+            BufferUsages::STORAGE | BufferUsages::COPY_DST | BufferUsages::COPY_SRC,
+        );
+        orchestrator.add_buffer(
+            BufferName::SimInfo,
+            size_of::<SimInfo>(),
+            BufferUsages::STORAGE | BufferUsages::COPY_DST | BufferUsages::COPY_SRC,
+        );
+        orchestrator.add_buffer(
+            BufferName::AtomicValues,
+            ((size_of::<AtomicValues>() - 1) / 16 + 1) * 16,
+            BufferUsages::STORAGE | BufferUsages::COPY_DST | BufferUsages::COPY_SRC,
+        );
+        block_on(orchestrator.write_buffer(
+            BufferName::SimInfo,
+            &[SimInfo {
+                timestep: 2,
+                ..Default::default()
+            }],
+        ))
+        .expect("Failed to write sim info");
+
+        // Mass 1.0 in cell (0,0) and mass 3.0 in cell (2,1).
+        // Expected center of mass: ((2.5 * 1 + 12.5 * 3) / 4, (2.5 * 1 + 7.5 * 3) / 4)
+        let mass_factor = if orchestrator.has_float32_atomic() {
+            1.0
+        } else {
+            10.0
+        };
+        orchestrator
+            .resources
+            .add_texture_with_data(
+                &orchestrator.device,
+                &orchestrator.queue,
+                &[8848.0f32; 6],
+                TextureName::Dem,
+                Extent3d {
+                    width: settings.grid_shape_x,
+                    height: settings.grid_shape_y,
+                    depth_or_array_layers: 1,
+                },
+                TextureFormat::R32Float,
+                TextureUsages::TEXTURE_BINDING
+                    | TextureUsages::STORAGE_BINDING
+                    | TextureUsages::COPY_DST
+                    | TextureUsages::COPY_SRC,
+            )
+            .expect("Failed to add texture with data");
+        let masses = [1.0f32, 0.0, 0.0, 0.0, 0.0, 3.0];
+        if orchestrator.has_float32_atomic() {
+            block_on(orchestrator.write_buffer(BufferName::GridMass, &masses))
+                .expect("Failed to write grid mass");
+        } else {
+            let encoded: Vec<u32> = masses.iter().map(|&m| (m * mass_factor) as u32).collect();
+            block_on(orchestrator.write_buffer(BufferName::GridMass, &encoded))
+                .expect("Failed to write grid mass");
+        }
+
+        let result = block_on(orchestrator.run_compute_center_of_mass(&settings))
+            .expect("GPU center of mass failed");
+
+        assert!(
+            (result.total_mass - 4.0).abs() < 1e-4,
+            "total mass was {}",
+            result.total_mass
+        );
+        assert!(
+            (result.com_x - 10.0).abs() < 1e-4,
+            "com_x was {}",
+            result.com_x
+        );
+        assert!(
+            (result.com_y - 6.25).abs() < 1e-4,
+            "com_y was {}",
+            result.com_y
+        );
+        assert!(
+            (result.elevation - 8848.0).abs() < 1e-4,
+            "elevation was {}",
+            result.elevation
+        );
+    }
+
+    #[test_log::test]
+    fn test_compute_chamfer_distance() {
+        // 3x3 grid with cell_size 5: a simulated cell at (2,0) and ROI cells at
+        // (0,0) and (2,2). Every nearest distance is 2 cells = 10 world units,
+        // the grid diagonal is 15*sqrt(2).
+        let settings = settings::SimSettings {
+            grid_shape_x: 3,
+            grid_shape_y: 3,
+            cell_size: 5.0,
+            peak_flow_thickness_threshold: 1.0,
+            ..Default::default()
+        };
+        let mut orchestrator =
+            block_on(ComputeOrchestrator::new()).expect("Failed to create ComputeOrchestrator");
+        orchestrator
+            .create_buffers_and_texture_descriptions(&settings)
+            .expect("Failed to create GPU resources");
+        block_on(orchestrator.write_buffer(
+            BufferName::GridPeakFlowThickness,
+            &[0.0f32, 0.0, 2.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+        ))
+        .expect("Failed to write peak flow thicknesses");
+        block_on(orchestrator.write_buffer(BufferName::RegionOfInterest, &[0b1_0000_0001u32]))
+            .expect("Failed to write region of interest");
+
+        let result = block_on(orchestrator.run_compute_chamfer_distance(&settings))
+            .expect("GPU chamfer distance failed");
+
+        let expected_per_direction = 10.0 / (15.0 * (2.0f64).sqrt());
+        assert!(
+            (result.sim_to_roi - expected_per_direction).abs() < 1e-6,
+            "sim_to_roi was {}",
+            result.sim_to_roi
+        );
+        assert!(
+            (result.roi_to_sim - expected_per_direction).abs() < 1e-6,
+            "roi_to_sim was {}",
+            result.roi_to_sim
+        );
+        assert!(
+            (result.chamfer - 2.0 * expected_per_direction).abs() < 1e-6,
+            "chamfer was {}",
+            result.chamfer
+        );
+
+        // without simulated cells every ROI cell has no nearest counterpart,
+        // so the chamfer distance is infinite
+        block_on(orchestrator.write_buffer(BufferName::GridPeakFlowThickness, &[0.0f32; 9]))
+            .expect("Failed to reset peak flow thicknesses");
+        let empty_simulation = block_on(orchestrator.run_compute_chamfer_distance(&settings))
+            .expect("GPU chamfer distance without simulated cells failed");
+        assert!(empty_simulation.chamfer.is_infinite());
+        assert_eq!(empty_simulation.sim_to_roi, 0.0);
     }
 
     #[test_log::test]

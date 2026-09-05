@@ -199,7 +199,7 @@ def ax2d(ax, sim, parameter, title="Avalanche Simulation", threshold_value=1e-3)
     surf = ax.contourf(x, y, data, cmap='magma')
     ax.contour(x, y, sim.release_areas.astype(np.float32), colors='cyan', linewidths=1, alpha=0.3)
     ax.legend(
-        handles=[plt.lines.Line2D([0], [0], color="cyan", lw=1, alpha=0.8, label="Release Areas")],
+        handles=[plt.Line2D([0], [0], color="cyan", lw=1, alpha=0.8, label="Release Areas")],
     )
     ax.set(title=title)
     return ax, surf, x, y

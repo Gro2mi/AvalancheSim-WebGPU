@@ -60,6 +60,55 @@ pub fn evaluate_mass_movement_area(
     ))
 }
 
+/// Diagonal-normalized chamfer distance between the simulated cells and the
+/// reference (region of interest) cells.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ChamferDistance {
+    /// Mean nearest-neighbor distance from simulated cells to the nearest
+    /// region-of-interest cell, normalized by the grid diagonal.
+    /// Infinite if there are simulated cells but the ROI is empty.
+    pub sim_to_roi: f64,
+    /// Mean nearest-neighbor distance from region-of-interest cells to the
+    /// nearest simulated cell, normalized by the grid diagonal.
+    /// Infinite if there are ROI cells but the simulation is empty.
+    pub roi_to_sim: f64,
+    /// `sim_to_roi + roi_to_sim`; 0.0 if both masks are empty.
+    pub chamfer: f64,
+}
+
+/// Combines the raw GPU sums into the diagonal-normalized chamfer distance.
+///
+/// * `sum_sim_to_roi` / `count_sim` - sum of nearest ROI distances over all simulated cells
+/// * `sum_roi_to_sim` / `count_roi` - sum of nearest simulated-cell distances over all ROI cells
+/// * `diagonal` - length of the grid diagonal in world units
+pub(crate) fn chamfer_from_sums(
+    sum_sim_to_roi: f32,
+    count_sim: f32,
+    sum_roi_to_sim: f32,
+    count_roi: f32,
+    diagonal: f64,
+) -> ChamferDistance {
+    let sim_to_roi = if count_sim == 0.0 {
+        0.0
+    } else if count_roi == 0.0 {
+        f64::INFINITY
+    } else {
+        sum_sim_to_roi as f64 / count_sim as f64 / diagonal
+    };
+    let roi_to_sim = if count_roi == 0.0 {
+        0.0
+    } else if count_sim == 0.0 {
+        f64::INFINITY
+    } else {
+        sum_roi_to_sim as f64 / count_roi as f64 / diagonal
+    };
+    ChamferDistance {
+        sim_to_roi,
+        roi_to_sim,
+        chamfer: sim_to_roi + roi_to_sim,
+    }
+}
+
 pub(crate) fn evaluation_from_counts(
     count_intersection: u32,
     count_undershoot: u32,
@@ -287,6 +336,40 @@ mod tests {
             evaluate_mass_movement_area(&empty_ref, &valid_sim),
             Err(MassMovementEvaluationError::EmptyGrid)
         );
+    }
+
+    #[test]
+    fn test_chamfer_from_sums_matches_manual() {
+        // 3x3 grid with cell_size 5: a simulated cell at (2,0) and ROI cells at
+        // (0,0) and (2,2). Every nearest distance is 2 cells = 10 world units,
+        // the grid diagonal is 15*sqrt(2).
+        let diagonal = 15.0 * (2.0f64).sqrt();
+        let result = chamfer_from_sums(10.0, 1.0, 20.0, 2.0, diagonal);
+        let expected_per_direction = 10.0 / diagonal;
+        assert!((result.sim_to_roi - expected_per_direction).abs() < 1e-9);
+        assert!((result.roi_to_sim - expected_per_direction).abs() < 1e-9);
+        assert!((result.chamfer - 2.0 * expected_per_direction).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_chamfer_from_sums_empty_masks() {
+        let diagonal = 10.0;
+
+        // both masks empty -> perfect score, matching the Jaccard convention
+        let both_empty = chamfer_from_sums(0.0, 0.0, 0.0, 0.0, diagonal);
+        assert_eq!(both_empty.chamfer, 0.0);
+
+        // only ROI cells: their nearest simulated cell does not exist
+        let only_roi = chamfer_from_sums(0.0, 0.0, 5.0, 1.0, diagonal);
+        assert!(only_roi.chamfer.is_infinite());
+        assert_eq!(only_roi.sim_to_roi, 0.0);
+        assert_eq!(only_roi.roi_to_sim, f64::INFINITY);
+
+        // only simulated cells
+        let only_sim = chamfer_from_sums(5.0, 1.0, 0.0, 0.0, diagonal);
+        assert!(only_sim.chamfer.is_infinite());
+        assert_eq!(only_sim.sim_to_roi, f64::INFINITY);
+        assert_eq!(only_sim.roi_to_sim, 0.0);
     }
 
     fn assert_near(actual: f64, expected: f64) {

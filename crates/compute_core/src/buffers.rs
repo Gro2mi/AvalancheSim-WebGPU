@@ -29,6 +29,45 @@ pub struct AtomicValues {
     pub stopped_particles: u32,
 }
 
+/// GPU layout mirror of the CenterOfMassResult struct in compute_center_of_mass.wgsl
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Pod, Zeroable)]
+pub struct CenterOfMassResult {
+    pub com_x: f32,
+    pub com_y: f32,
+    pub elevation: f32,
+    pub total_mass: f32,
+}
+
+impl Default for CenterOfMassResult {
+    fn default() -> Self {
+        Self {
+            com_x: f32::NAN,
+            com_y: f32::NAN,
+            elevation: f32::NAN,
+            total_mass: f32::NAN,
+        }
+    }
+}
+
+/// GPU layout mirror of the ChamferParams struct in chamfer_flood.wgsl
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Pod, Zeroable, Default)]
+pub struct ChamferParams {
+    pub step: u32,
+    pub _padding: [u32; 3],
+}
+
+/// GPU layout mirror of the ChamferDistanceResult struct in chamfer_reduce.wgsl
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Pod, Zeroable, Default)]
+pub struct ChamferDistanceResult {
+    pub sum_sim_to_roi: f32,
+    pub count_sim: f32,
+    pub sum_roi_to_sim: f32,
+    pub count_roi: f32,
+}
+
 #[derive(Eq, Hash, PartialEq, Clone)]
 pub enum BufferName {
     SimInfo,
@@ -68,6 +107,16 @@ pub enum BufferName {
 
     EvaluationCounts,
 
+    CenterOfMass,
+
+    // chamfer distance between simulated cells and the region of interest
+    ChamferParams,
+    ChamferNearestRoi,
+    ChamferNearestRoiSnapshot,
+    ChamferNearestSim,
+    ChamferNearestSimSnapshot,
+    ChamferDistance,
+
     TestOutput,
 }
 
@@ -102,6 +151,13 @@ impl BufferName {
             BufferName::GridForces => "grid_forces",
             BufferName::RegionOfInterest => "region_of_interest",
             BufferName::EvaluationCounts => "evaluation_counts",
+            BufferName::CenterOfMass => "center_of_mass",
+            BufferName::ChamferParams => "chamfer_params",
+            BufferName::ChamferNearestRoi => "chamfer_nearest_roi",
+            BufferName::ChamferNearestRoiSnapshot => "chamfer_nearest_roi_snapshot",
+            BufferName::ChamferNearestSim => "chamfer_nearest_sim",
+            BufferName::ChamferNearestSimSnapshot => "chamfer_nearest_sim_snapshot",
+            BufferName::ChamferDistance => "chamfer_distance",
         }
     }
 }
@@ -145,6 +201,13 @@ impl std::str::FromStr for BufferName {
             "grid_forces" => Ok(BufferName::GridForces),
             "region_of_interest" => Ok(BufferName::RegionOfInterest),
             "evaluation_counts" => Ok(BufferName::EvaluationCounts),
+            "center_of_mass" => Ok(BufferName::CenterOfMass),
+            "chamfer_params" => Ok(BufferName::ChamferParams),
+            "chamfer_nearest_roi" => Ok(BufferName::ChamferNearestRoi),
+            "chamfer_nearest_roi_snapshot" => Ok(BufferName::ChamferNearestRoiSnapshot),
+            "chamfer_nearest_sim" => Ok(BufferName::ChamferNearestSim),
+            "chamfer_nearest_sim_snapshot" => Ok(BufferName::ChamferNearestSimSnapshot),
+            "chamfer_distance" => Ok(BufferName::ChamferDistance),
             _ => Err(format!("Unknown buffer name: {}", name)),
         }
     }
@@ -867,6 +930,19 @@ mod tests {
             (BufferName::ReleaseAreas, "release_areas"),
             (BufferName::TestOutput, "test_output"),
             (BufferName::GridForces, "grid_forces"),
+            (BufferName::CenterOfMass, "center_of_mass"),
+            (BufferName::ChamferParams, "chamfer_params"),
+            (BufferName::ChamferNearestRoi, "chamfer_nearest_roi"),
+            (
+                BufferName::ChamferNearestRoiSnapshot,
+                "chamfer_nearest_roi_snapshot",
+            ),
+            (BufferName::ChamferNearestSim, "chamfer_nearest_sim"),
+            (
+                BufferName::ChamferNearestSimSnapshot,
+                "chamfer_nearest_sim_snapshot",
+            ),
+            (BufferName::ChamferDistance, "chamfer_distance"),
         ];
 
         for (name, expected) in cases {
