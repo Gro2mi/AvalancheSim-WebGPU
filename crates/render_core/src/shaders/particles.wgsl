@@ -41,9 +41,14 @@ fn vs_main(@builtin(vertex_index) vertex_index: u32) -> VertexOutput {
     let index = vertex_index / 6u;
     let offset = corner_offsets[vertex_index % 6u];
 
-    // The simulation stores x and y in the DEM plane; y maps to the renderer's z axis.
+    // The simulation stores x and y in the DEM plane; y runs against the
+    // renderer's z axis so the world stays right-handed (+z south).
     let plane = positions[index];
-    let centre = vec3<f32>(plane.x, elevations[index] * u.up.w + u.grid.w, plane.y);
+    let centre = vec3<f32>(
+        plane.x,
+        elevations[index] * u.up.w + u.grid.w,
+        (u.grid.y - 1.0) * u.grid.z - plane.y,
+    );
 
     let radius = u.right.w;
     let world = centre + u.right.xyz * (offset.x * radius) + u.up.xyz * (offset.y * radius);

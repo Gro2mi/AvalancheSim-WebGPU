@@ -7,6 +7,8 @@ use wgpu::util::DeviceExt;
 const NODATA_THRESHOLD: f32 = -1.0;
 
 /// A regular elevation grid, stored row-major starting at the south-west corner.
+/// In render world space row 0 sits at the maximum z, so `+x` runs east and `+z`
+/// runs south — the right-handed counterpart of the map's `{east, up, north}`.
 #[derive(Clone, Debug)]
 pub struct TerrainData {
     width: u32,
@@ -165,7 +167,7 @@ impl TerrainData {
         Vec3::new(
             x as f32 * self.cell_size,
             elevation,
-            y as f32 * self.cell_size,
+            (self.height - 1 - y) as f32 * self.cell_size,
         )
     }
 

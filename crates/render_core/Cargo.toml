@@ -32,3 +32,6 @@ name = "dem_snapshot"
 
 [[example]]
 name = "live_sim"
+
+[[example]]
+name = "video_export"

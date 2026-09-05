@@ -65,14 +65,17 @@ fn vs_main(@builtin(vertex_index) vertex_index: u32) -> VertexOutput {
 
     let cell = u.grid.z;
     let height = sample_texel(gx, gy).x;
-    let world = vec3<f32>(f32(gx) * cell, height, f32(gy) * cell);
+    // Row 0 (the map's south edge) sits at the maximum z, keeping the world
+    // right-handed: +x east, +z south.
+    let world = vec3<f32>(f32(gx) * cell, height, (u.grid.y - 1.0 - f32(gy)) * cell);
 
     // Central differences on the neighbouring samples give the surface normal.
+    // World z runs against the row index, so the z slope term is `up - down`.
     let left = neighbour_height(gx - 1, gy, height);
     let right = neighbour_height(gx + 1, gy, height);
     let down = neighbour_height(gx, gy - 1, height);
     let up = neighbour_height(gx, gy + 1, height);
-    let normal = normalize(vec3<f32>(left - right, 2.0 * cell, down - up));
+    let normal = normalize(vec3<f32>(left - right, 2.0 * cell, up - down));
 
     // A quad is drawn only when all four of its samples hold real data.
     let valid = min(

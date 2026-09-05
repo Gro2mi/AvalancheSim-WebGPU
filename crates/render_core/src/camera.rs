@@ -11,7 +11,8 @@ const VIEW_YAW_OFFSET: f32 = 0.3;
 
 /// Orbit camera: looks at `target` from a point on a sphere defined by `yaw`, `pitch` and `distance`.
 ///
-/// World space is y-up: `x` runs along DEM columns, `z` along DEM rows, `y` is elevation.
+/// World space is y-up and right-handed: `x` runs east along DEM columns, `z`
+/// runs south against DEM rows, `y` is elevation.
 #[derive(Clone, Copy, Debug)]
 pub struct OrbitCamera {
     pub target: Vec3,
@@ -308,8 +309,9 @@ mod tests {
 
     #[test]
     fn default_framing_faces_the_mountain_from_the_valley() {
-        // Terrain rising towards +z: the camera must stand on the low (-z) side
-        // looking uphill at the mountain face, not behind the summit.
+        // Terrain rising towards +row: with row 0 at maximum world z, the high
+        // ground lies at low z and the camera must stand on the high-z (south,
+        // low-elevation) side looking at the mountain face, not behind the summit.
         let (width, height) = (64u32, 64u32);
         let heights = (0..height)
             .flat_map(|y| (0..width).map(move |_x| 100.0 + y as f32 * 5.0))
@@ -319,14 +321,14 @@ mod tests {
         let camera = OrbitCamera::framing(&terrain, 16.0 / 9.0);
         let eye = camera.eye();
         assert!(
-            eye.z < camera.target.z,
-            "camera should stand on the low side: eye.z {} vs target.z {}",
+            eye.z > camera.target.z,
+            "camera should stand on the low-elevation side: eye.z {} vs target.z {}",
             eye.z,
             camera.target.z
         );
         // The high corner must stay in view, so the framing still fits the terrain.
         let view_proj = camera.view_projection();
-        let ndc = transform_point(view_proj, Vec3::new(0.0, 400.0, 630.0));
+        let ndc = transform_point(view_proj, Vec3::new(0.0, 400.0, 0.0));
         assert!(
             ndc.x.abs() <= 1.0 && ndc.y.abs() <= 1.0,
             "summit corner out of view: {ndc:?}"
