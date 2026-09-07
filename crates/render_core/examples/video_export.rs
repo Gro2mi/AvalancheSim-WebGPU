@@ -180,7 +180,7 @@ fn clone_particle_buffers(
         clone_buffer(BufferName::ParticlesPosition)?,
         clone_buffer(BufferName::ParticlesVelocity)?,
         velocity_z,
-        clone_buffer(BufferName::ParticlesStopped)?,
+        clone_buffer(BufferName::ParticlesState)?,
         clone_buffer(BufferName::ParticlesElevation)?,
     ])
 }

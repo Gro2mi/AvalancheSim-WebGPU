@@ -78,6 +78,47 @@ impl std::fmt::Debug for SimInfoFlags {
     }
 }
 
+const PARTICLE_FLYING: u32 = 27u32 << 0;
+const PARTICLE_OUT_OF_BOUNDS: u32 = 28u32 << 0;
+const PARTICLE_IS_NAN: u32 = 1u32 << 29;
+const PARTICLE_OUT_OF_DEM_DATA: u32 = 1u32 << 30;
+const PARTICLE_STOPPED: u32 = 1u32 << 31;
+
+#[derive(Clone, Copy, Debug, Default, Hash, PartialEq, Eq)]
+pub struct ParticleState {
+    pub flying: bool,
+    pub out_of_bounds: bool,
+    pub is_nan: bool,
+    pub out_of_dem_data: bool,
+    pub stopped: bool,
+    pub naturally_stopped: bool,
+    pub timestep: u32,
+}
+
+impl From<u32> for ParticleState {
+    fn from(state: u32) -> Self {
+        let stopped = state & PARTICLE_STOPPED != 0;
+        let is_nan = state & PARTICLE_IS_NAN != 0;
+        let out_of_dem_data = state & PARTICLE_OUT_OF_DEM_DATA != 0;
+        let out_of_bounds = state & PARTICLE_OUT_OF_BOUNDS == PARTICLE_OUT_OF_BOUNDS;
+        let status_flags = PARTICLE_FLYING
+            | PARTICLE_OUT_OF_BOUNDS
+            | PARTICLE_IS_NAN
+            | PARTICLE_OUT_OF_DEM_DATA
+            | PARTICLE_STOPPED;
+
+        Self {
+            flying: state & PARTICLE_FLYING == PARTICLE_FLYING,
+            out_of_bounds,
+            is_nan,
+            out_of_dem_data,
+            stopped,
+            naturally_stopped: !out_of_bounds && !is_nan && !out_of_dem_data,
+            timestep: if stopped { state & !status_flags } else { 0 },
+        }
+    }
+}
+
 pub struct TextureRgba<T> {
     pub r: Vec<T>,
     pub g: Vec<T>,
@@ -101,7 +142,7 @@ pub struct GpuCache {
     pub particles_mass: Option<Vec<f32>>,
     pub particles_velocity: Option<Vec<[f32; 2]>>,
     pub particles_velocity_z: Option<Vec<f32>>,
-    pub particles_stopped: Option<Vec<u32>>,
+    pub particles_stopped: Option<Vec<ParticleState>>,
     pub particles_elevation: Option<Vec<f32>>,
     pub peak_velocity: Option<Vec<f32>>,
     pub peak_flow_thickness: Option<Vec<f32>>,
@@ -1236,7 +1277,7 @@ impl ComputeOrchestrator {
         );
         let init_particles_stopped = vec![0u32; number_release_particles as usize];
         self.add_buffer_with_data(
-            BufferName::ParticlesStopped,
+            BufferName::ParticlesState,
             &init_particles_stopped,
             BufferUsages::STORAGE | BufferUsages::COPY_DST | BufferUsages::COPY_SRC,
         );
@@ -1323,7 +1364,7 @@ impl ComputeOrchestrator {
         );
 
         let sim_info = SimInfo {
-            timestep: 1,
+            timestep: 0,
             number_particles: number_release_particles,
             // estimated timestep for a 60 degree slope
             dt: (2.0 * sim_settings.cfl * sim_settings.cell_size / (9.81 * 0.866) as f32).sqrt(),

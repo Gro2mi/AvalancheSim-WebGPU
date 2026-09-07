@@ -299,7 +299,7 @@ fn main() -> Result<()> {
         let pos = block_on(simulation.fetch_particles_position())
             .unwrap()
             .clone();
-        let stopped = block_on(simulation.fetch_particles_stopped())
+        let state = block_on(simulation.fetch_particles_state())
             .unwrap()
             .clone();
         let max_speed = vel
@@ -309,12 +309,12 @@ fn main() -> Result<()> {
         debug!("DBG max particle speed: {}", max_speed);
         debug!("DBG first positions: {:?}", &pos[..5.min(pos.len())]);
         debug!("DBG first velocities: {:?}", &vel[..5.min(vel.len())]);
-        let n_stopped = stopped.iter().filter(|&&s| s != 0).count();
-        let max_stop_step = stopped.iter().copied().max().unwrap_or(0);
+        let n_stopped = state.iter().filter(|state| state.stopped).count();
+        let max_stop_step = state.iter().map(|state| state.timestep).max().unwrap_or(0);
         debug!(
             "DBG stopped {} / {}, max stop marker {}",
             n_stopped,
-            stopped.len(),
+            state.len(),
             max_stop_step
         );
         debug!(

@@ -27,7 +27,7 @@ struct TimestepData {
 @group(0) @binding(7) var<storage, read_write> particles_velocity: array<vec2<f32>>;
 @group(0) @binding(8) var<storage, read_write> particles_velocity_z: array<f32>;
 @group(0) @binding(9) var<storage, read_write> particles_mass: array<f32>;
-@group(0) @binding(10) var<storage, read_write> particles_stopped: array<u32>;
+@group(0) @binding(10) var<storage, read_write> particles_state: array<u32>;
 
 @group(0) @binding(11) var<storage, read_write> atomic_values: AtomicValues;
 
@@ -56,8 +56,8 @@ fn compute_particles(
     if (sim_info.flags & SIM_INFO_STOPPED) != 0u {
         return;
     }
-    var stopped = particles_stopped[particleId];
-    if stopped != 0u {
+    var state = particles_state[particleId];
+    if (state & PARTICLE_STOPPED) != 0u {
         return;
     }
     let p = particles_position[particleId];
@@ -67,7 +67,9 @@ fn compute_particles(
     let normal = get_normal(uv);
 
     if is_nan(normal.x) {
-        particles_stopped[particleId] = 1000000000u + sim_info.timestep;
+        state = sim_info.timestep;
+        state |= PARTICLE_OUT_OF_DEM_DATA;
+        particles_state[particleId] = state;
         atomicAdd(&atomic_values.stopped_particles, 1u);
         sim_info.flags |= SIM_INFO_PARTICLE_OUT_OF_DEM_DATA;
         return;
@@ -148,7 +150,8 @@ fn compute_particles(
     let velocity_length = length(velocity);
     if velocity_length < acceleration_friction_magnitude * dt {
         dt = velocity_length / max(acceleration_friction_magnitude, 1e-6);
-        stopped = sim_info.timestep;
+        state = sim_info.timestep;
+        state |= PARTICLE_STOPPED;
     }
     if velocity_length > sim_settings.velocity_threshold {
         velocity -= acceleration_friction_magnitude * (velocity / velocity_length) * dt;
@@ -230,24 +233,31 @@ fn compute_particles(
     }
 
     if is_nan(position.x) {
-        particles_stopped[particleId] = 1100000000u + sim_info.timestep;
+        state = sim_info.timestep;
+        state |= PARTICLE_STOPPED;
+        state |= PARTICLE_IS_NAN;
+        particles_state[particleId] = state;
         atomicAdd(&atomic_values.stopped_particles, 1u);
         sim_info.flags |= SIM_INFO_IS_NAN;
         sim_info.flags |= SIM_INFO_PARTICLE_OUT_OF_DEM_DATA;
         return;
     }
     if is_nan(velocity.x) {
-        particles_stopped[particleId] = 1200000000u + sim_info.timestep;
+        state = sim_info.timestep;
+        state |= PARTICLE_STOPPED;
+        state |= PARTICLE_IS_NAN;
+        particles_state[particleId] = state;
         atomicAdd(&atomic_values.stopped_particles, 1u);
         sim_info.flags |= SIM_INFO_IS_NAN;
         return;
     }
 
     // stop criterion friction
-    if stopped != 0u || length(velocity) < sim_settings.velocity_threshold {
-        stopped = sim_info.timestep;
+    if (state & PARTICLE_STOPPED) != 0u || length(velocity) < sim_settings.velocity_threshold {
+        state = sim_info.timestep;
+        state |= PARTICLE_STOPPED;
         atomicAdd(&atomic_values.stopped_particles, 1u);
-        update_particle(particleId, position, velocity, stopped);
+        update_particle(particleId, position, velocity, state);
         return;
     }
     // we leave two cells boundary
@@ -255,13 +265,15 @@ fn compute_particles(
         || position.x > sim_settings.world_size.x - 2.1 * sim_settings.cell_size
         || position.y < 2.1 * sim_settings.cell_size 
         || position.y > sim_settings.world_size.y - 2.1 * sim_settings.cell_size {//|| elevation < sim_info.elevation_threshold {
-        stopped = sim_info.timestep;
+        state = sim_info.timestep;
+        state |= PARTICLE_STOPPED;
+        state |= PARTICLE_OUT_OF_BOUNDS;
         atomicAdd(&atomic_values.stopped_particles, 1u);
-        update_particle(particleId, position, velocity, stopped);
+        update_particle(particleId, position, velocity, state);
         sim_info.flags |= SIM_INFO_OUT_OF_BOUNDS;
         return;
     }
-    update_particle(particleId, position, velocity, stopped);
+    update_particle(particleId, position, velocity, state);
 }
 
 fn get_bed_curvature(position: vec3f, velocity: vec3f) -> f32 {
@@ -298,12 +310,12 @@ fn force_local_to_world(
          + 0f * normal;
 }
 
-fn update_particle(particleId: u32, position: vec3f, velocity: vec3f, stopped: u32) {
+fn update_particle(particleId: u32, position: vec3f, velocity: vec3f, state: u32) {
     particles_position[particleId] = position.xy;
     particles_elevation[particleId] = position.z;
     particles_velocity[particleId] = velocity.xy;
     particles_velocity_z[particleId] = velocity.z;
-    particles_stopped[particleId] = stopped;
+    particles_state[particleId] = state;
     // mass is constant for now
     // particles_mass[particleId] = mass; 
 }
@@ -396,7 +408,6 @@ fn acceleration_by_drag_friction(effective_acceleration_normal: f32, mass: f32, 
 const TEXTURE_GATHER_OFFSET = 1.0f / 512.0f;
 // Samples height texture with bilinear filtering.
 fn get_elevation(uv: vec2f) -> f32 {
-    // TODO: fix interpolation at the edges of the texture
     return textureSampleLevel(dem_texture, tex_sampler, uv, 0).x;
 }
 
@@ -480,6 +491,12 @@ const SIM_INFO_PARTICLE_OUT_OF_DEM_DATA: u32 = 1u << 3u;
 const SIM_INFO_STOPPED: u32 = 1u << 31u;
 const SIM_INFO_ALL_PARTICLES_STOPPED: u32 = 1u << 30u;
 const SIM_INFO_NO_NEW_CELLS: u32 = 1u << 29u;
+
+const PARTICLE_FLYING: u32 = 27u << 0u;
+const PARTICLE_OUT_OF_BOUNDS: u32 = 28u << 0u;
+const PARTICLE_IS_NAN: u32 = 1u << 29u;
+const PARTICLE_OUT_OF_DEM_DATA: u32 = 1u << 30u;
+const PARTICLE_STOPPED: u32 = 1u << 31u;
 
 struct SimSettings {
     num_steps: u32,

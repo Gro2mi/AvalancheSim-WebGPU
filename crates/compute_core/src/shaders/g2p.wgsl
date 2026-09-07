@@ -23,7 +23,7 @@ struct TimestepData {
 @group(0) @binding(3) var tex_sampler: sampler;
 @group(0) @binding(4) var<storage, read_write> particles_position: array<vec2<f32>>;
 @group(0) @binding(5) var<storage, read_write> particles_velocity: array<vec2<f32>>;
-@group(0) @binding(6) var<storage, read_write> particles_stopped: array<u32>;
+@group(0) @binding(6) var<storage, read_write> particles_state: array<u32>;
 @group(0) @binding(7) var<storage, read> grid_velocity: array<vec2<f32>>;
 
 @group(0) @binding(8) var<storage, read_write> atomic_values: AtomicValues;
@@ -52,7 +52,7 @@ fn g2p(
     if (sim_info.flags & SIM_INFO_STOPPED) != 0u {
         return;
     }
-    if particles_stopped[particleId] != 0u {
+    if (particles_state[particleId] & PARTICLE_STOPPED) != 0u {
         return;
     }
     var position = particles_position[particleId];
@@ -68,7 +68,9 @@ fn g2p(
     let l_y = terrain_data.y;
 
     if is_nan(l_x) {
-        particles_stopped[particleId] = 1000000000u + sim_info.timestep;
+        var state = sim_info.timestep;
+        state |= PARTICLE_STOPPED;
+        particles_state[particleId] = state;
         atomicAdd(&atomic_values.stopped_particles, 1u);
         sim_info.flags |= SIM_INFO_PARTICLE_OUT_OF_DEM_DATA;
         return;
@@ -78,9 +80,6 @@ fn g2p(
     // let update = transfer_g2p(particleId);
     // let interpolated_velocity = update.velocity;
     // let new_affine_matrix = update.affine_matrix;
-    
-
-    
 
     // var dt = sim_settings.cfl * sim_settings.cell_size / (sim_info.max_velocity + sim_settings.velocity_threshold);
     var dt = sim_info.dt;
@@ -94,7 +93,7 @@ fn g2p(
     // TODO PIC is very diffusive, try APIC or FLIP
     let new_velocity = interpolated_velocity;
     var velocity_contravariant = vec2f(new_velocity.x / l_x, new_velocity.y / l_y);
-    position =  position + velocity_contravariant * dt;
+    position = position + velocity_contravariant * dt;
 
     particles_position[particleId] = position;
     particles_velocity[particleId] = new_velocity;
@@ -138,33 +137,44 @@ fn g2p(
         out_debug[11] = f32(sim_settings.world_size.y);
         out_debug[12] = f32(sim_settings.friction_coefficient);
     }
-    
-    // if dot(interpolated_velocity, interpolated_velocity) < sim_settings.velocity_threshold * sim_settings.velocity_threshold {
-    //     particles_stopped[particleId] = sim_info.timestep;
-    //     atomicAdd(&atomic_values.stopped_particles, 1u);
-    //     return;
-    // }
 
-    // if is_nan(position.x) {
-    //     particles_stopped[particleId] = 1100000000u + sim_info.timestep;
-    //     atomicAdd(&atomic_values.stopped_particles, 1u);
-    //     sim_info.flags |= SIM_INFO_IS_NAN;
-    //     sim_info.flags |= SIM_INFO_PARTICLE_OUT_OF_DEM_DATA;
-    //     return;
-    // }
-    // if is_nan(velocity.x) {
-    //     particles_stopped[particleId] = 1200000000u + sim_info.timestep;
-    //     atomicAdd(&atomic_values.stopped_particles, 1u);
-    //     sim_info.flags |= SIM_INFO_IS_NAN;
-    //     return;
-    // }
+    if dot(interpolated_velocity, interpolated_velocity) < sim_settings.velocity_threshold * sim_settings.velocity_threshold {
+        var state = sim_info.timestep;
+        state |= PARTICLE_STOPPED;
+        particles_state[particleId] = state;
+        atomicAdd(&atomic_values.stopped_particles, 1u);
+        return;
+    }
+
+    if is_nan(position.x) {
+        var state = sim_info.timestep;
+        state |= PARTICLE_STOPPED;
+        state |= PARTICLE_OUT_OF_DEM_DATA;
+        particles_state[particleId] = state;
+        atomicAdd(&atomic_values.stopped_particles, 1u);
+        sim_info.flags |= SIM_INFO_IS_NAN;
+        sim_info.flags |= SIM_INFO_PARTICLE_OUT_OF_DEM_DATA;
+        return;
+    }
+    if is_nan(velocity.x) {
+        var state = sim_info.timestep;
+        state |= PARTICLE_STOPPED;
+        state |= PARTICLE_OUT_OF_DEM_DATA;
+        particles_state[particleId] = state;
+        atomicAdd(&atomic_values.stopped_particles, 1u);
+        sim_info.flags |= SIM_INFO_IS_NAN;
+        return;
+    }
 
     // we leave a two cell boundary
     if position.x < 2.0 * sim_settings.cell_size 
         || position.x > sim_settings.world_size.x - 2.0 * sim_settings.cell_size
         || position.y < 2.0 * sim_settings.cell_size 
         || position.y > sim_settings.world_size.y - 2.0 * sim_settings.cell_size {//|| elevation < sim_info.elevation_threshold {
-        particles_stopped[particleId] = sim_info.timestep;
+        var state = sim_info.timestep;
+        state |= PARTICLE_STOPPED;
+        state |= PARTICLE_OUT_OF_BOUNDS;
+        particles_state[particleId] = state;
         atomicAdd(&atomic_values.stopped_particles, 1u);
         sim_info.flags |= SIM_INFO_OUT_OF_BOUNDS;
         return;
@@ -322,6 +332,12 @@ const SIM_INFO_PARTICLE_OUT_OF_DEM_DATA: u32 = 1u << 3u;
 const SIM_INFO_STOPPED: u32 = 1u << 31u;
 const SIM_INFO_ALL_PARTICLES_STOPPED: u32 = 1u << 30u;
 const SIM_INFO_NO_NEW_CELLS: u32 = 1u << 29u;
+
+const PARTICLE_FLYING: u32 = 27u << 0u;
+const PARTICLE_OUT_OF_BOUNDS: u32 = 28u << 0u;
+const PARTICLE_IS_NAN: u32 = 1u << 29u;
+const PARTICLE_OUT_OF_DEM_DATA: u32 = 1u << 30u;
+const PARTICLE_STOPPED: u32 = 1u << 31u;
 
 struct SimSettings {
     num_steps: u32,

@@ -1,6 +1,6 @@
 use anyhow::{Result, bail};
 use compute_core::{
-    ComputeOrchestrator, GpuCache, SimInfo, SimInfoFlags, TextureRgba, TimestepData,
+    ComputeOrchestrator, GpuCache, ParticleState, SimInfo, SimInfoFlags, TextureRgba, TimestepData,
     buffers::{AtomicValues, BufferName, CenterOfMassResult, TextureName},
     dem::{Bounds, Dem},
     post_processing::*,
@@ -1121,17 +1121,18 @@ impl Simulation {
         Ok(self.gpu_cache.particles_elevation.as_ref().unwrap())
     }
 
-    pub async fn fetch_particles_stopped(&mut self) -> Result<&Vec<u32>> {
+    pub async fn fetch_particles_state(&mut self) -> Result<&Vec<ParticleState>> {
         if self.state < SimulationState::ParticlesInitialized {
             bail!("Simulation must be initialized before reading particles");
         }
         if self.gpu_cache.particles_stopped.is_none() {
             self.gpu_cache.read_count += 1;
-            self.gpu_cache.particles_stopped = Some(
-                self.orchestrator
-                    .read_buffer(BufferName::ParticlesStopped)
-                    .await?,
-            );
+            let raw_states = self
+                .orchestrator
+                .read_buffer::<u32>(BufferName::ParticlesState)
+                .await?;
+            self.gpu_cache.particles_stopped =
+                Some(raw_states.into_iter().map(ParticleState::from).collect());
         }
         Ok(self.gpu_cache.particles_stopped.as_ref().unwrap())
     }
@@ -1141,7 +1142,7 @@ impl Simulation {
         self.fetch_particles_velocity().await?;
         self.fetch_particles_mass().await?;
         self.fetch_particles_elevation().await?;
-        self.fetch_particles_stopped().await?;
+        self.fetch_particles_state().await?;
         Ok(())
     }
 
@@ -1433,7 +1434,7 @@ mod tests {
         // First call: Should trigger a "read" and populate the Option
         block_on(sim.fetch_results()).expect("Failed to get data on first call");
         let first_ref =
-            block_on(sim.fetch_particles_stopped()).expect("Failed to get particles on first call");
+            block_on(sim.fetch_particles_state()).expect("Failed to get particles on first call");
         let uncached_state = calculate_hash(&first_ref);
         assert_eq!(
             sim.get_gpu_cache_read_count(),
@@ -1444,8 +1445,8 @@ mod tests {
 
         // Second call: Should return the cached value
         block_on(sim.fetch_results()).expect("Failed to get data on second call");
-        let second_ref = block_on(sim.fetch_particles_stopped())
-            .expect("Failed to get particles on second call");
+        let second_ref =
+            block_on(sim.fetch_particles_state()).expect("Failed to get particles on second call");
         let cached_state = calculate_hash(&second_ref);
         assert_eq!(
             sim.get_gpu_cache_read_count(),
@@ -1486,7 +1487,7 @@ mod tests {
         );
 
         let third_ref =
-            block_on(sim.fetch_particles_stopped()).expect("Failed to get particles on third call");
+            block_on(sim.fetch_particles_state()).expect("Failed to get particles on third call");
         let third_state = calculate_hash(&third_ref);
         // hash changed after sim with different settings, confirming cache was reset
         assert_ne!(
@@ -1858,13 +1859,19 @@ mod tests {
         info!("Atomic values: {:?}", atomics);
         assert_eq!(atomics.number_release_particles, 16);
         assert_eq!(atomics.stopped_particles, 16);
-        let stopped = block_on(sim.fetch_particles_stopped()).expect("Failed to fetch particles");
+        let stopped = block_on(sim.fetch_particles_state()).expect("Failed to fetch particles");
         println!(
             "Particles stopped at step 0: {}",
-            stopped.iter().filter(|&&x| x == 0).count()
+            stopped.iter().filter(|state| state.timestep == 0).count()
         );
-        assert_eq!(stopped.iter().filter(|&&x| x > 10).count(), 0);
-        assert_eq!(stopped.iter().filter(|&&x| x == 0).count(), 0);
+        assert_eq!(
+            stopped.iter().filter(|state| state.timestep > 10).count(),
+            0
+        );
+        assert_eq!(
+            stopped.iter().filter(|state| state.timestep == 0).count(),
+            0
+        );
         for p in stopped.iter() {
             info!("{:?}", p);
         }
@@ -1940,23 +1947,25 @@ mod tests {
         .expect("SimInfo buffer was empty");
         info!("Read sim info: {:?}", sim_info);
         // particles dont stop, they fall off the DEM
-        let stopped =
-            block_on(sim.fetch_particles_stopped()).expect("Failed to read particles buffer");
+        let state = block_on(sim.fetch_particles_state()).expect("Failed to read particles buffer");
         info!(
             "Min step particle stopped: {}",
-            stopped.min_value().unwrap()
+            state.iter().map(|state| state.timestep).min().unwrap()
         );
         info!(
             "Max step particle stopped: {}",
-            stopped.max_value().unwrap()
+            state.iter().map(|state| state.timestep).max().unwrap()
         );
         // TODO fix this test
-        assert_eq!(stopped.iter().filter(|&&x| x > 4900).count(), 0);
+        assert_eq!(
+            state.iter().filter(|state| state.timestep > 4900).count(),
+            0
+        );
         println!(
             "Particles stopped at step 0: {}",
-            stopped.iter().filter(|&&x| x == 0).count()
+            state.iter().filter(|state| state.timestep == 0).count()
         );
-        assert!(stopped.iter().filter(|&&x| x == 0).count() < 20);
+        assert!(state.iter().filter(|state| state.timestep == 0).count() < 20);
 
         let max_velocity = block_on(sim.fetch_peak_velocity()).expect("Failed to get max velocity");
 

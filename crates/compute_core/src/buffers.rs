@@ -89,7 +89,7 @@ pub enum BufferName {
     ParticlesVelocity,
     ParticlesVelocityZ,
     ParticlesMass,
-    ParticlesStopped,
+    ParticlesState,
     ParticlesAffineMatrix,
 
     /// timestep data of the 0 index particle
@@ -132,7 +132,7 @@ impl BufferName {
             BufferName::ParticlesPosition => "particles_position",
             BufferName::ParticlesVelocity => "particles_velocity",
             BufferName::ParticlesMass => "particles_mass",
-            BufferName::ParticlesStopped => "particles_stopped",
+            BufferName::ParticlesState => "particles_state",
             BufferName::ParticlesElevation => "particles_elevation",
             BufferName::ParticlesAffineMatrix => "particles_affine_matrix",
             BufferName::ParticlesVelocityZ => "particles_velocity_z",
@@ -182,7 +182,7 @@ impl std::str::FromStr for BufferName {
             "particles_position" => Ok(BufferName::ParticlesPosition),
             "particles_velocity" => Ok(BufferName::ParticlesVelocity),
             "particles_mass" => Ok(BufferName::ParticlesMass),
-            "particles_stopped" => Ok(BufferName::ParticlesStopped),
+            "particles_state" => Ok(BufferName::ParticlesState),
             "particles_elevation" => Ok(BufferName::ParticlesElevation),
             "particles_velocity_z" => Ok(BufferName::ParticlesVelocityZ),
             "particles_affine_matrix" => Ok(BufferName::ParticlesAffineMatrix),

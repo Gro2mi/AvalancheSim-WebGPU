@@ -17,6 +17,7 @@ data/wind/tiles/
 tarpaulin-report.html
 export/
 *.bin
+my_sim.mp4
 frontend/js/pgk
 output.png
 .idea
