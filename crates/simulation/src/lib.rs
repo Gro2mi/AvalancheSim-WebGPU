@@ -154,6 +154,9 @@ pub struct Simulation {
     orchestrator: ComputeOrchestrator,
     /// Physics and numerics parameters in effect for this run.
     pub settings: SimSettings,
+    /// Whether the center-of-mass trajectory is tracked on the GPU.
+    pub enable_center_of_mass: bool,
+    /// Path the DEM was loaded from; empty when set programmatically.
     pub dem_path: String,
     /// The digital elevation model the simulation runs on.
     pub dem: Dem,
@@ -195,6 +198,7 @@ impl Simulation {
         Ok(Self {
             orchestrator,
             settings: SimSettings::default(),
+            enable_center_of_mass: true,
             output_path: "avalanchers".to_string(),
             dem_path: String::new(),
             dem: Dem::default(),
@@ -293,6 +297,7 @@ impl Simulation {
 
         Ok(SimulationLoadResult {
             settings: settings_result,
+            enable_center_of_mass: settings.enable_center_of_mass.unwrap_or(true),
             dem: dem_result,
             roi: outline,
             batch_compute_steps: settings.batch_compute_steps,
@@ -309,6 +314,9 @@ impl Simulation {
     /// [`SimulationState::DemMissing`] when the DEM is empty.
     pub fn apply_data(&mut self, data: SimulationLoadResult) {
         self.settings = data.settings;
+        self.enable_center_of_mass = data.enable_center_of_mass;
+        self.orchestrator
+            .set_enable_center_of_mass(self.enable_center_of_mass);
         if let Some(batch_steps) = data.batch_compute_steps {
             self.orchestrator.batch_compute_steps = batch_steps;
         }
@@ -2401,6 +2409,31 @@ mod tests {
         ])
         .expect("Failed to set release areas");
         sim
+    }
+
+    #[test_log::test]
+    fn test_print_default_simulation_buffer_sizes() {
+        let mut sim = block_on(Simulation::new()).expect("Failed to create Simulation");
+        block_on(sim.create(Settings::default())).expect("Failed to create simulation");
+        sim.set_dem(&[0.0; 36], 6, 6, 3.0)
+            .expect("Failed to set DEM");
+        sim.set_release_areas(&[
+            1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+            0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+            0.0, 0.0,
+        ])
+        .expect("Failed to set release areas");
+        block_on(sim.run()).expect("Failed to run default simulation");
+
+        let mut buffers = sim.orchestrator().resources.buffer_sizes();
+        buffers.sort_by(|left, right| left.0.cmp(&right.0));
+        println!("Default simulation buffers:");
+        for (name, size_bytes) in buffers {
+            println!(
+                "  {name}: {size_bytes} bytes ({:.2} KiB)",
+                size_bytes as f64 / 1024.0
+            );
+        }
     }
 
     #[test_log::test]

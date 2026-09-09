@@ -2,7 +2,7 @@ use crate::buffers::{
     AtomicValues, BufferName, CenterOfMassResult, ChamferParams, EvaluationResult, GpuResources,
     TextureName, create_buffers_and_texture_descriptions,
 };
-use crate::settings::SimModel;
+use crate::settings::{SimFlags, SimModel};
 use crate::shaders::{ComputeShaderConfig, ShaderName, generate_shader_report};
 use crate::utils::timer_checkpoint;
 use anyhow::{Context, Result, anyhow};
@@ -439,6 +439,8 @@ struct SimulationPipelines {
     grid_physics: ComputePipeline,
     particle_update: ComputePipeline,
     update_sim_info: ComputePipeline,
+    center_of_mass_seed: ComputePipeline,
+    center_of_mass_propagate: ComputePipeline,
     center_of_mass: ComputePipeline,
 }
 
@@ -448,6 +450,8 @@ struct SimulationBindGroups {
     grid_physics: BindGroup,
     particle_update: BindGroup,
     update_sim_info: BindGroup,
+    center_of_mass_seed: BindGroup,
+    center_of_mass_propagate: BindGroup,
     center_of_mass: BindGroup,
 }
 
@@ -474,6 +478,8 @@ pub struct ComputeOrchestrator {
     simulation_bind_groups: Option<SimulationBindGroups>,
     has_float32_filterable: bool,
     has_float32_atomic: bool,
+    pub enable_center_of_mass: bool,
+    center_of_mass_biggest_blob: bool,
 }
 
 impl ComputeOrchestrator {
@@ -740,11 +746,17 @@ impl ComputeOrchestrator {
             batch_compute_steps: 200,
             has_float32_atomic,
             completed_steps: 0,
+            enable_center_of_mass: true,
+            center_of_mass_biggest_blob: false,
         })
     }
 
     pub fn has_float32_atomic(&self) -> bool {
         self.has_float32_atomic
+    }
+
+    pub fn set_enable_center_of_mass(&mut self, enabled: bool) {
+        self.enable_center_of_mass = enabled;
     }
 
     // Helper function to safely parse hex ("0x1e84") or decimal strings into a u32 Device ID
@@ -974,11 +986,15 @@ impl ComputeOrchestrator {
         Ok(number_release_cells)
     }
 
-    /// Computes the center of mass of the grid mass buffer on the GPU.
+    /// Computes the center of mass of the biggest mass blob of the grid mass
+    /// buffer on the GPU.
     ///
-    /// The shader runs as a single workgroup with a strided loop, so the
-    /// dispatch size does not depend on the grid shape. The result `com` is
-    /// in world coordinates, `total_mass` in the decoded grid mass unit.
+    /// Dispatches the full center-of-mass pipeline: full-grid seeding and
+    /// label propagation (blob mode only), then the reduction as a single
+    /// workgroup. The mode is selected by the
+    /// `center_of_mass_biggest_blob` settings flag. The result `com` is in
+    /// world coordinates, `total_mass` in the decoded grid mass unit, written
+    /// to the result slot of the current `sim_info.timestep`.
     pub async fn run_compute_center_of_mass(
         &mut self,
         sim_settings: &settings::SimSettings,
@@ -991,15 +1007,34 @@ impl ComputeOrchestrator {
             BufferName::SimSettings,
             sim_settings.as_bytes(),
         )?;
+        let dispatch_x = sim_settings.grid_shape_x.div_ceil(WORKGROUP_SIZE_2D);
+        let dispatch_y = sim_settings.grid_shape_y.div_ceil(WORKGROUP_SIZE_2D);
+        if SimFlags::from_u32(sim_settings.flags).is_center_of_mass_biggest_blob_enabled() {
+            self.run_shader(&ShaderName::CenterOfMassSeed, dispatch_x, dispatch_y, 1)
+                .await?;
+            self.run_shader(
+                &ShaderName::CenterOfMassPropagate,
+                dispatch_x,
+                dispatch_y,
+                1,
+            )
+            .await?;
+        }
         self.run_shader(&ShaderName::ComputeCenterOfMass, 1, 1, 1)
             .await?;
+        let timestep = self
+            .read_buffer::<SimInfo>(BufferName::SimInfo)
+            .await?
+            .first()
+            .map(|info| info.timestep as usize)
+            .unwrap_or(0);
         let result = self
             .read_buffer::<CenterOfMassResult>(BufferName::CenterOfMass)
             .await?;
         result
-            .first()
+            .get(timestep)
             .copied()
-            .ok_or_else(|| anyhow!("CenterOfMass buffer was empty"))
+            .ok_or_else(|| anyhow!("CenterOfMass buffer has no slot for timestep {timestep}"))
     }
 
     /// Computes the diagonal-normalized chamfer distance between the simulated
@@ -1410,6 +1445,14 @@ impl ComputeOrchestrator {
             .shader_configs
             .get(&ShaderName::ComputeCenterOfMass)
             .ok_or_else(|| anyhow!("ComputeCenterOfMass shader config not found"))?;
+        let center_of_mass_seed_config = self
+            .shader_configs
+            .get(&ShaderName::CenterOfMassSeed)
+            .ok_or_else(|| anyhow!("CenterOfMassSeed shader config not found"))?;
+        let center_of_mass_propagate_config = self
+            .shader_configs
+            .get(&ShaderName::CenterOfMassPropagate)
+            .ok_or_else(|| anyhow!("CenterOfMassPropagate shader config not found"))?;
         let reset_grid_config = self
             .shader_configs
             .get(&ShaderName::ResetGrid)
@@ -1421,6 +1464,8 @@ impl ComputeOrchestrator {
             grid_physics: grid_physics_config.pipeline.clone(),
             particle_update: particle_update_config.pipeline.clone(),
             update_sim_info: update_sim_info_config.pipeline.clone(),
+            center_of_mass_seed: center_of_mass_seed_config.pipeline.clone(),
+            center_of_mass_propagate: center_of_mass_propagate_config.pipeline.clone(),
             center_of_mass: compute_center_of_mass_config.pipeline.clone(),
         });
         self.simulation_bind_groups = Some(SimulationBindGroups {
@@ -1431,12 +1476,18 @@ impl ComputeOrchestrator {
                 .create_bind_group(&self.device, &self.resources)?,
             update_sim_info: update_sim_info_config
                 .create_bind_group(&self.device, &self.resources)?,
+            center_of_mass_seed: center_of_mass_seed_config
+                .create_bind_group(&self.device, &self.resources)?,
+            center_of_mass_propagate: center_of_mass_propagate_config
+                .create_bind_group(&self.device, &self.resources)?,
             center_of_mass: compute_center_of_mass_config
                 .create_bind_group(&self.device, &self.resources)?,
         });
 
         self.prepared_max_steps = Some(sim_settings.max_steps);
         self.prepared_model = Some(sim_settings.sim_model);
+        self.center_of_mass_biggest_blob =
+            SimFlags::from_u32(sim_settings.flags).is_center_of_mass_biggest_blob_enabled();
         Ok(())
     }
 
@@ -1527,9 +1578,35 @@ impl ComputeOrchestrator {
                 compute_pass.set_bind_group(0, &simulation_bind_groups.update_sim_info, &[]);
                 compute_pass.dispatch_workgroups(1, 1, 1);
 
-                compute_pass.set_pipeline(&simulation_pipelines.center_of_mass);
-                compute_pass.set_bind_group(0, &simulation_bind_groups.center_of_mass, &[]);
-                compute_pass.dispatch_workgroups(self.dispatch_number_workgroups_1d, 1, 1);
+                if self.enable_center_of_mass {
+                    if self.center_of_mass_biggest_blob {
+                        compute_pass.set_pipeline(&simulation_pipelines.center_of_mass_seed);
+                        compute_pass.set_bind_group(
+                            0,
+                            &simulation_bind_groups.center_of_mass_seed,
+                            &[],
+                        );
+                        compute_pass.dispatch_workgroups(
+                            self.dispatch_number_workgroups_x_2d,
+                            self.dispatch_number_workgroups_y_2d,
+                            1,
+                        );
+                        compute_pass.set_pipeline(&simulation_pipelines.center_of_mass_propagate);
+                        compute_pass.set_bind_group(
+                            0,
+                            &simulation_bind_groups.center_of_mass_propagate,
+                            &[],
+                        );
+                        compute_pass.dispatch_workgroups(
+                            self.dispatch_number_workgroups_x_2d,
+                            self.dispatch_number_workgroups_y_2d,
+                            1,
+                        );
+                    }
+                    compute_pass.set_pipeline(&simulation_pipelines.center_of_mass);
+                    compute_pass.set_bind_group(0, &simulation_bind_groups.center_of_mass, &[]);
+                    compute_pass.dispatch_workgroups(1, 1, 1);
+                }
             }
         }
         self.queue.submit(Some(command_encoder.finish()));
@@ -1940,6 +2017,7 @@ mod tests {
             grid_shape_x: 3,
             grid_shape_y: 2,
             cell_size: 5.0,
+            flags: SimFlags::new(true, true, true, true, true).mask,
             ..Default::default()
         };
         let mut orchestrator =
@@ -1949,11 +2027,11 @@ mod tests {
             .expect("Failed to create GPU resources");
 
         // the shader binds sim_info, dem, sampler and atomic_values and writes
-        // to the slot sim_info.timestep - 2, so provide them here as
+        // to the slot sim_info.timestep, so provide them here as
         // prepare_simulation would
         orchestrator.add_buffer_with_data(
             BufferName::CenterOfMass,
-            &[CenterOfMassResult::default()],
+            &[CenterOfMassResult::default(); 3],
             BufferUsages::STORAGE | BufferUsages::COPY_DST | BufferUsages::COPY_SRC,
         );
         orchestrator.add_buffer(
@@ -1975,13 +2053,6 @@ mod tests {
         ))
         .expect("Failed to write sim info");
 
-        // Mass 1.0 in cell (0,0) and mass 3.0 in cell (2,1).
-        // Expected center of mass: ((2.5 * 1 + 12.5 * 3) / 4, (2.5 * 1 + 7.5 * 3) / 4)
-        let mass_factor = if orchestrator.has_float32_atomic() {
-            1.0
-        } else {
-            10.0
-        };
         orchestrator
             .resources
             .add_texture_with_data(
@@ -2001,31 +2072,43 @@ mod tests {
                     | TextureUsages::COPY_SRC,
             )
             .expect("Failed to add texture with data");
-        let masses = [1.0f32, 0.0, 0.0, 0.0, 0.0, 3.0];
-        if orchestrator.has_float32_atomic() {
-            block_on(orchestrator.write_buffer(BufferName::GridMass, &masses))
-                .expect("Failed to write grid mass");
-        } else {
-            let encoded: Vec<u32> = masses.iter().map(|&m| (m * mass_factor) as u32).collect();
-            block_on(orchestrator.write_buffer(BufferName::GridMass, &encoded))
-                .expect("Failed to write grid mass");
+        // helper to write decoded masses in both buffer encodings
+        fn write_grid_masses(orchestrator: &mut ComputeOrchestrator, masses: &[f32]) {
+            let mass_factor = if orchestrator.has_float32_atomic() {
+                1.0
+            } else {
+                10.0
+            };
+            if orchestrator.has_float32_atomic() {
+                block_on(orchestrator.write_buffer(BufferName::GridMass, masses))
+                    .expect("Failed to write grid mass");
+            } else {
+                let encoded: Vec<u32> = masses.iter().map(|&m| (m * mass_factor) as u32).collect();
+                block_on(orchestrator.write_buffer(BufferName::GridMass, &encoded))
+                    .expect("Failed to write grid mass");
+            }
         }
+
+        // Scenario 1: mass split into two disconnected blobs (3x2 grid, 8-connected).
+        // Mass 1.0 in cell (0,0) and mass 3.0 in cell (2,1) do not touch, so the
+        // biggest blob is the isolated mass 3.0 and the 1.0 blob is ignored.
+        write_grid_masses(&mut orchestrator, &[1.0f32, 0.0, 0.0, 0.0, 0.0, 3.0]);
 
         let result = block_on(orchestrator.run_compute_center_of_mass(&settings))
             .expect("GPU center of mass failed");
 
         assert!(
-            (result.total_mass - 4.0).abs() < 1e-4,
+            (result.total_mass - 3.0).abs() < 1e-4,
             "total mass was {}",
             result.total_mass
         );
         assert!(
-            (result.com_x - 10.0).abs() < 1e-4,
+            (result.com_x - 12.5).abs() < 1e-4,
             "com_x was {}",
             result.com_x
         );
         assert!(
-            (result.com_y - 6.25).abs() < 1e-4,
+            (result.com_y - 7.5).abs() < 1e-4,
             "com_y was {}",
             result.com_y
         );
@@ -2033,6 +2116,67 @@ mod tests {
             (result.elevation - 8848.0).abs() < 1e-4,
             "elevation was {}",
             result.elevation
+        );
+
+        // Scenario 2: adding mass 1.0 in cell (1,0) connects all three cells
+        // into one blob of total mass 5, so all masses contribute.
+        // Expected center of mass:
+        // ((2.5 + 7.5 + 12.5 * 3) / 5, (2.5 + 2.5 + 7.5 * 3) / 5) = (9.5, 5.5)
+        write_grid_masses(&mut orchestrator, &[1.0f32, 1.0, 0.0, 0.0, 0.0, 3.0]);
+
+        let connected = block_on(orchestrator.run_compute_center_of_mass(&settings))
+            .expect("GPU center of mass failed");
+
+        assert!(
+            (connected.total_mass - 5.0).abs() < 1e-4,
+            "total mass was {}",
+            connected.total_mass
+        );
+        assert!(
+            (connected.com_x - 9.5).abs() < 1e-4,
+            "com_x was {}",
+            connected.com_x
+        );
+        assert!(
+            (connected.com_y - 5.5).abs() < 1e-4,
+            "com_y was {}",
+            connected.com_y
+        );
+        assert!(
+            (connected.elevation - 8848.0).abs() < 1e-4,
+            "elevation was {}",
+            connected.elevation
+        );
+
+        // Scenario 3: whole-grid mode (center_of_mass_biggest_blob disabled):
+        // every mass cell contributes regardless of connectivity, so the
+        // disconnected blobs give total mass 4 and
+        // ((2.5 * 1 + 12.5 * 3) / 4, (2.5 * 1 + 7.5 * 3) / 4) = (10.0, 6.25)
+        settings.flags &= !(1u32 << 4);
+        write_grid_masses(&mut orchestrator, &[1.0f32, 0.0, 0.0, 0.0, 0.0, 3.0]);
+
+        let whole_grid = block_on(orchestrator.run_compute_center_of_mass(&settings))
+            .expect("GPU center of mass failed");
+
+        assert!(
+            (whole_grid.total_mass - 4.0).abs() < 1e-4,
+            "total mass was {}",
+            whole_grid.total_mass
+        );
+        assert!(
+            (whole_grid.com_x - 10.0).abs() < 1e-4,
+            "com_x was {}",
+            whole_grid.com_x
+        );
+        assert!(
+            (whole_grid.com_y - 6.25).abs() < 1e-4,
+            "com_y was {}",
+            whole_grid.com_y
+        );
+        assert!(
+            (whole_grid.elevation - 8848.0).abs() < 1e-4,
+            "elevation was {}",
+            whole_grid.elevation
         );
     }
 

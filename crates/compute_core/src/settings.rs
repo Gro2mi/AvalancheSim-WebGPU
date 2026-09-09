@@ -23,6 +23,7 @@ impl SimFlags {
         particle_interaction: bool,
         earth_pressure_coefficient: bool,
         entrainment: bool,
+        center_of_mass_biggest_blob: bool,
     ) -> Self {
         let mut mask = 0u32;
         if curvature {
@@ -36,6 +37,9 @@ impl SimFlags {
         }
         if entrainment {
             mask |= 1 << 3;
+        }
+        if center_of_mass_biggest_blob {
+            mask |= 1 << 4;
         }
 
         SimFlags { mask }
@@ -56,6 +60,9 @@ impl SimFlags {
     }
     pub fn is_entrainment_enabled(&self) -> bool {
         (self.mask & (1 << 3)) != 0
+    }
+    pub fn is_center_of_mass_biggest_blob_enabled(&self) -> bool {
+        (self.mask & (1 << 4)) != 0
     }
 }
 #[repr(C)]
@@ -170,7 +177,7 @@ impl SimSettings {
             cell_size: 1.0,
             velocity_threshold: 0.1,
             roughness_threshold: 0.01,
-            flags: SimFlags::new(true, true, true, true).mask,
+            flags: SimFlags::new(true, true, true, true, false).mask,
 
             min_slope_angle: 28.0,
             max_slope_angle: 60.0,
@@ -290,6 +297,13 @@ impl SimSettings {
                 settings.flags |= 1 << 3;
             } else {
                 settings.flags &= !(1 << 3);
+            }
+        }
+        if let Some(val) = patch.center_of_mass_biggest_blob {
+            if val {
+                settings.flags |= 1 << 4;
+            } else {
+                settings.flags &= !(1 << 4);
             }
         }
         settings.set_dem(dem);
@@ -557,6 +571,10 @@ pub struct Settings {
     pub enable_particle_interaction: Option<bool>,
     pub enable_earth_pressure_coefficient: Option<bool>,
     pub enable_entrainment: Option<bool>,
+    pub enable_center_of_mass: Option<bool>,
+    /// Center the mass of the biggest connected mass blob instead of the
+    /// whole grid (defaults to true).
+    pub center_of_mass_biggest_blob: Option<bool>,
 }
 
 impl Settings {
@@ -694,6 +712,8 @@ mod tests {
             enable_particle_interaction: Some(false),
             enable_earth_pressure_coefficient: Some(false),
             enable_entrainment: Some(false),
+            enable_center_of_mass: Some(true),
+            center_of_mass_biggest_blob: Some(false),
         };
         let dem = create_test_dem();
         let mut sim_settings = SimSettings::from_settings(&patch, &dem);
@@ -727,7 +747,7 @@ mod tests {
         assert_eq!(sim_settings.basal_friction_angle, 45.0);
         assert_eq!(
             sim_settings.flags,
-            SimFlags::new(false, false, false, false).mask
+            SimFlags::new(false, false, false, false, false).mask
         );
 
         // Test enabling flags one by one
@@ -735,28 +755,35 @@ mod tests {
         sim_settings = SimSettings::from_settings(&patch, &dem);
         assert_eq!(
             sim_settings.flags,
-            SimFlags::new(true, false, false, false).mask
+            SimFlags::new(true, false, false, false, false).mask
         );
 
         patch.enable_particle_interaction = Some(true);
         sim_settings = SimSettings::from_settings(&patch, &dem);
         assert_eq!(
             sim_settings.flags,
-            SimFlags::new(true, true, false, false).mask
+            SimFlags::new(true, true, false, false, false).mask
         );
 
         patch.enable_earth_pressure_coefficient = Some(true);
         sim_settings = SimSettings::from_settings(&patch, &dem);
         assert_eq!(
             sim_settings.flags,
-            SimFlags::new(true, true, true, false).mask
+            SimFlags::new(true, true, true, false, false).mask
         );
 
         patch.enable_entrainment = Some(true);
         sim_settings = SimSettings::from_settings(&patch, &dem);
         assert_eq!(
             sim_settings.flags,
-            SimFlags::new(true, true, true, true).mask
+            SimFlags::new(true, true, true, true, false).mask
+        );
+
+        patch.center_of_mass_biggest_blob = Some(true);
+        sim_settings = SimSettings::from_settings(&patch, &dem);
+        assert_eq!(
+            sim_settings.flags,
+            SimFlags::new(true, true, true, true, true).mask
         );
     }
 

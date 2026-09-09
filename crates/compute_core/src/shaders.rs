@@ -78,6 +78,8 @@ define_shaders! {
     ComputeRoughness => "compute_roughness",
     ComputeReleaseAreas => "compute_release_areas",
     ComputeCenterOfMass => "compute_center_of_mass",
+    CenterOfMassSeed => "center_of_mass_seed",
+    CenterOfMassPropagate => "center_of_mass_propagate",
     ChamferPrepare => "chamfer_prepare",
     ChamferFlood => "chamfer_flood",
     ChamferReduce => "chamfer_reduce",
@@ -717,6 +719,112 @@ pub fn create_shader_configs(
                         min_binding_size: None,
                     },
                 ),
+                // Binding 7:
+                (
+                    BufferName::CenterOfMassLabels.to_string(),
+                    BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: false },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                ),
+                // Binding 8:
+                (
+                    BufferName::CenterOfMassBlobMass.to_string(),
+                    BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: false },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                ),
+            ],
+        )?,
+    );
+
+    shader_configs.insert(
+        ShaderName::CenterOfMassSeed,
+        ComputeShaderConfig::new(
+            device,
+            ShaderName::CenterOfMassSeed,
+            load_shader_source(ShaderName::CenterOfMassSeed, has_float32_atomic),
+            &[
+                // Binding 0:
+                (
+                    BufferName::SimSettings.to_string(),
+                    BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                ),
+                // Binding 1:
+                (
+                    BufferName::GridMass.to_string(),
+                    BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                ),
+                // Binding 2:
+                (
+                    BufferName::CenterOfMassLabels.to_string(),
+                    BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: false },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                ),
+                // Binding 3:
+                (
+                    BufferName::SimInfo.to_string(),
+                    BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                ),
+            ],
+        )?,
+    );
+
+    shader_configs.insert(
+        ShaderName::CenterOfMassPropagate,
+        ComputeShaderConfig::new(
+            device,
+            ShaderName::CenterOfMassPropagate,
+            load_shader_source(ShaderName::CenterOfMassPropagate, has_float32_atomic),
+            &[
+                // Binding 0:
+                (
+                    BufferName::SimSettings.to_string(),
+                    BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                ),
+                // Binding 1:
+                (
+                    BufferName::CenterOfMassLabels.to_string(),
+                    BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: false },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                ),
+                // Binding 2:
+                (
+                    BufferName::SimInfo.to_string(),
+                    BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                ),
+            ],
+        )?,
+    );
 
     shader_configs.insert(
         ShaderName::ComputeBeelineDistance,

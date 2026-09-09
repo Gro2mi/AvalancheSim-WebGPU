@@ -132,6 +132,11 @@ pub enum BufferName {
 
     CenterOfMass,
 
+    /// per-cell blob label for the biggest-blob detection in compute_center_of_mass
+    CenterOfMassLabels,
+    /// per-blob accumulated encoded mass for the biggest-blob detection
+    CenterOfMassBlobMass,
+
     // chamfer distance between simulated cells and the region of interest
     ChamferParams,
     ChamferNearestRoi,
@@ -174,6 +179,8 @@ impl BufferName {
             BufferName::RegionOfInterest => "region_of_interest",
             BufferName::EvaluationResult => "evaluation_result",
             BufferName::CenterOfMass => "center_of_mass",
+            BufferName::CenterOfMassLabels => "center_of_mass_labels",
+            BufferName::CenterOfMassBlobMass => "center_of_mass_blob_mass",
             BufferName::ChamferParams => "chamfer_params",
             BufferName::ChamferNearestRoi => "chamfer_nearest_roi",
             BufferName::ChamferNearestRoiSnapshot => "chamfer_nearest_roi_snapshot",
@@ -223,6 +230,8 @@ impl std::str::FromStr for BufferName {
             "region_of_interest" => Ok(BufferName::RegionOfInterest),
             "evaluation_result" => Ok(BufferName::EvaluationResult),
             "center_of_mass" => Ok(BufferName::CenterOfMass),
+            "center_of_mass_labels" => Ok(BufferName::CenterOfMassLabels),
+            "center_of_mass_blob_mass" => Ok(BufferName::CenterOfMassBlobMass),
             "chamfer_params" => Ok(BufferName::ChamferParams),
             "chamfer_nearest_roi" => Ok(BufferName::ChamferNearestRoi),
             "chamfer_nearest_roi_snapshot" => Ok(BufferName::ChamferNearestRoiSnapshot),
@@ -386,6 +395,14 @@ impl GpuResources {
 
     pub fn get_buffer_mut(&mut self, name: BufferName) -> Option<&mut Buffer> {
         self.buffers.get_mut(&name)
+    }
+
+    /// Returns the currently allocated buffers and their GPU allocation sizes.
+    pub fn buffer_sizes(&self) -> Vec<(String, u64)> {
+        self.buffers
+            .iter()
+            .map(|(name, buffer)| (name.to_string(), buffer.size()))
+            .collect()
     }
 
     pub async fn read_buffer<T: bytemuck::Pod + Send + Sync>(
@@ -853,6 +870,19 @@ pub fn create_buffers_and_texture_descriptions(
         grid_bytes_size,
         BufferUsages::STORAGE | BufferUsages::COPY_SRC | BufferUsages::COPY_DST,
     );
+    // scratch for the biggest-blob detection in compute_center_of_mass
+    gpu_resources.add_buffer(
+        device,
+        BufferName::CenterOfMassLabels,
+        grid_bytes_size,
+        BufferUsages::STORAGE | BufferUsages::COPY_SRC | BufferUsages::COPY_DST,
+    );
+    gpu_resources.add_buffer(
+        device,
+        BufferName::CenterOfMassBlobMass,
+        grid_bytes_size,
+        BufferUsages::STORAGE | BufferUsages::COPY_SRC | BufferUsages::COPY_DST,
+    );
     gpu_resources.add_buffer(
         device,
         BufferName::GridMomentum,
@@ -951,6 +981,8 @@ mod tests {
             (BufferName::TestOutput, "test_output"),
             (BufferName::GridForces, "grid_forces"),
             (BufferName::CenterOfMass, "center_of_mass"),
+            (BufferName::CenterOfMassLabels, "center_of_mass_labels"),
+            (BufferName::CenterOfMassBlobMass, "center_of_mass_blob_mass"),
             (BufferName::ChamferParams, "chamfer_params"),
             (BufferName::ChamferNearestRoi, "chamfer_nearest_roi"),
             (

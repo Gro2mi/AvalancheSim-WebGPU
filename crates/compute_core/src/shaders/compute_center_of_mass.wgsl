@@ -1,8 +1,24 @@
 // Computes the center of mass of the flattened grid mass buffer.
 //
-// Runs as a single workgroup with a strided loop over all cells, so no
-// atomics are needed and it works on hardware without float32 atomic
-// support. Dispatch exactly one workgroup.
+// Two modes, selected with sim_settings flag bit 4 (the
+// center_of_mass_biggest_blob setting):
+// - biggest blob (bit set, default): the mass can split into multiple
+//   disconnected blobs during the simulation, so the biggest blob (by total
+//   mass, 8-connected) is detected first and only its cells contribute.
+// - whole grid (bit clear): every mass cell contributes.
+//
+// This is the final reduction stage of a three-shader pipeline and must be
+// dispatched as exactly one workgroup after center_of_mass_seed and
+// center_of_mass_propagate have filled the label buffer (both early-out when
+// the whole-grid mode is selected). Blob mode then:
+// 1. verifies the blob labels converged (unit-step hooking with pointer
+//    compression until nothing changes - usually one pass)
+// 2. accumulates the encoded mass per blob label
+// 3. picks the label of the biggest blob and accumulates its center of mass
+//
+// Runs as a single workgroup with a strided loop over all cells, so the
+// workgroup barriers provide full global synchronization and no atomics on
+// f32 are needed.
 //
 // Output: total_mass in the same unit as the decoded grid mass,
 // com in world coordinates (same units as sim_settings.cell_size);
@@ -13,34 +29,161 @@ struct CenterOfMassResult {
     total_mass: f32,
 }
 
+const CENTER_OF_MASS_BIGGEST_BLOB: u32 = 1u << 4u;
+
 @group(0) @binding(1) var<storage, read> mass_buffer: array<u32>; // no_atomic_float
 // atomic_float @group(0) @binding(1) var<storage, read> mass_buffer: array<f32>;
 @group(0) @binding(2) var<storage, read_write> center_of_mass: array<CenterOfMassResult>;
-@group(0) @binding(3) var<storage, read_write> sim_info: SimInfo;
+@group(0) @binding(3) var<storage> sim_info: SimInfo;
 @group(0) @binding(4) var dem_texture: texture_2d<f32>;
 @group(0) @binding(5) var tex_sampler: sampler;
 @group(0) @binding(6) var<storage, read_write> atomic_values: AtomicValues;
+@group(0) @binding(7) var<storage, read_write> blob_labels: array<u32>;
+@group(0) @binding(8) var<storage, read_write> blob_mass: array<atomic<u32>>; // no_atomic_float
+// atomic_float @group(0) @binding(8) var<storage, read_write> blob_mass: array<atomic<f32>>;
 
 const WG_SIZE: u32 = 256u;
+const NO_BLOB: u32 = 0xFFFFFFFFu;
 
 var<workgroup> wg_mass: array<f32, WG_SIZE>;
 var<workgroup> wg_moment: array<vec2f, WG_SIZE>;
+var<workgroup> wg_best: array<vec2u, WG_SIZE>;
+var<workgroup> wg_changed: atomic<u32>;
+
+fn min_neighbor_label(cell: vec2i, label: u32, grid_shape: vec2i) -> u32 {
+    var best = label;
+    for (var dy = -1i; dy <= 1; dy = dy + 1) {
+        for (var dx = -1i; dx <= 1; dx = dx + 1) {
+            if dx == 0 && dy == 0 {
+                continue;
+            }
+            let n = cell + vec2i(dx, dy);
+            if n.x < 0 || n.y < 0 || n.x >= grid_shape.x || n.y >= grid_shape.y {
+                continue;
+            }
+            let neighbor_label = blob_labels[u32(n.y) * sim_settings.grid_shape.x + u32(n.x)];
+            best = min(best, neighbor_label);
+        }
+    }
+    return best;
+}
 
 @compute @workgroup_size(WG_SIZE, 1, 1)
 fn compute_center_of_mass(@builtin(local_invocation_index) li: u32) {
+    if (sim_info.flags & SIM_INFO_STOPPED) != 0u {
+        return;
+    }
     let num_cells = sim_settings.grid_shape.x * sim_settings.grid_shape.y;
+    let grid_shape_i = vec2i(sim_settings.grid_shape);
+    let use_biggest_blob = (sim_settings.flags & CENTER_OF_MASS_BIGGEST_BLOB) != 0u;
 
     var mass = 0.0;
     var moment = vec2f(0.0, 0.0);
-    for (var i = li; i < num_cells; i = i + WG_SIZE) {
-        let m = f32(mass_buffer[i]) * INV_MASS_FACTOR; // no_atomic_float
-        // atomic_float let m = mass_buffer[i];
-        if m > 0.0 && is_finite(m) {
-            let position = cell_center_xy(idx_to_xy(i));
-            mass = mass + m;
-            moment = moment + position * m;
+
+    if use_biggest_blob {
+        // 1. hook the labels with their 8 neighbors and compress label chains
+        //    until nothing changes. Values can only decrease, so racing with
+        //    other invocations updating neighbors in the same pass is safe. The
+        //    propagate shader has already done the heavy lifting, so this
+        //    usually converges after a single verification pass.
+        var iterations = 0u;
+        loop {
+            atomicStore(&wg_changed, 0u);
+            workgroupBarrier();
+            for (var i = li; i < num_cells; i = i + WG_SIZE) {
+                let current = blob_labels[i];
+                if current != NO_BLOB {
+                    var label = min(current, min_neighbor_label(vec2i(idx_to_xy(i)), current, grid_shape_i));
+                    // pointer compression: adopt the label our label points to
+                    label = min(label, blob_labels[label]);
+                    if label < current {
+                        blob_labels[i] = label;
+                        atomicStore(&wg_changed, 1u);
+                    }
+                }
+            }
+            workgroupBarrier();
+            if atomicLoad(&wg_changed) == 0u {
+                break;
+            }
+            workgroupBarrier();
+            iterations = iterations + 1u;
+            if iterations > sim_settings.grid_shape.x + sim_settings.grid_shape.y {
+                break; // a blob cannot be longer than the grid perimeter
+            }
+        }
+
+        // 2. accumulate the encoded mass per blob label
+        for (var i = li; i < num_cells; i = i + WG_SIZE) {
+            atomicStore(&blob_mass[i], 0u); // no_atomic_float
+            // atomic_float atomicStore(&blob_mass[i], 0.0);
+        }
+        workgroupBarrier();
+        for (var i = li; i < num_cells; i = i + WG_SIZE) {
+            if blob_labels[i] != NO_BLOB {
+                atomicAdd(&blob_mass[blob_labels[i]], mass_buffer[i]);
+            }
+        }
+        workgroupBarrier();
+
+        // 3. find the biggest blob (ties keep the lower label)
+        var best_mass = 0u; // no_atomic_float
+        // atomic_float var best_mass = 0.0;
+        var best_label = NO_BLOB;
+        for (var i = li; i < num_cells; i = i + WG_SIZE) {
+            let label = blob_labels[i];
+            if label != NO_BLOB {
+                let m = atomicLoad(&blob_mass[label]);
+                if m > best_mass {
+                    best_mass = m;
+                    best_label = label;
+                }
+            }
+        }
+        wg_best[li] = vec2u(best_mass, best_label); // no_atomic_float
+        // atomic_float wg_best[li] = vec2u(u32(best_mass), best_label);
+        workgroupBarrier();
+
+        var best_stride = WG_SIZE / 2u;
+        loop {
+            if li < best_stride {
+                let a = wg_best[li];
+                let b = wg_best[li + best_stride];
+                wg_best[li] = select(a, b, b.x > a.x);
+            }
+            workgroupBarrier();
+            if best_stride == 1u {
+                break;
+            }
+            best_stride = best_stride >> 1u;
+        }
+        let biggest_label = wg_best[0].y;
+
+        // only the cells of the biggest blob contribute
+        for (var i = li; i < num_cells; i = i + WG_SIZE) {
+            if blob_labels[i] == biggest_label {
+                let m = f32(mass_buffer[i]) * INV_MASS_FACTOR; // no_atomic_float
+                // atomic_float let m = mass_buffer[i];
+                if m > 0.0 && is_finite(m) {
+                    let position = cell_center_xy(idx_to_xy(i));
+                    mass = mass + m;
+                    moment = moment + position * m;
+                }
+            }
+        }
+    } else {
+        // whole-grid mode: every mass cell contributes
+        for (var i = li; i < num_cells; i = i + WG_SIZE) {
+            let m = f32(mass_buffer[i]) * INV_MASS_FACTOR; // no_atomic_float
+            // atomic_float let m = mass_buffer[i];
+            if m > 0.0 && is_finite(m) {
+                let position = cell_center_xy(idx_to_xy(i));
+                mass = mass + m;
+                moment = moment + position * m;
+            }
         }
     }
+
     wg_mass[li] = mass;
     wg_moment[li] = moment;
     workgroupBarrier();
@@ -60,13 +203,14 @@ fn compute_center_of_mass(@builtin(local_invocation_index) li: u32) {
     }
 
     if li == 0u {
+        let timestep = sim_info.timestep;
         let total_mass = wg_mass[0];
         let x = wg_moment[0].x / total_mass;
         let y = wg_moment[0].y / total_mass;
         // new_position = p_star;
         var elevation = get_elevation(vec2f(x, y));
-        center_of_mass[sim_info.timestep-2].total_mass = total_mass;
-        center_of_mass[sim_info.timestep-2].com = select(vec3f(0.0, 0.0, 0.0), vec3f(x, y, elevation), total_mass > 0.0);
+        center_of_mass[timestep].total_mass = total_mass;
+        center_of_mass[timestep].com = select(vec3f(0.0, 0.0, 0.0), vec3f(x, y, elevation), total_mass > 0.0);
     }
 }
 fn get_elevation(position_xy: vec2f) -> f32 {
@@ -113,6 +257,12 @@ const SIM_INFO_PARTICLE_OUT_OF_DEM_DATA: u32 = 1u << 3u;
 const SIM_INFO_STOPPED: u32 = 1u << 31u;
 const SIM_INFO_ALL_PARTICLES_STOPPED: u32 = 1u << 30u;
 const SIM_INFO_NO_NEW_CELLS: u32 = 1u << 29u;
+
+const PARTICLE_FLYING: u32 = 1u << 27u;
+const PARTICLE_OUT_OF_BOUNDS: u32 = 1u << 28u;
+const PARTICLE_IS_NAN: u32 = 1u << 29u;
+const PARTICLE_OUT_OF_DEM_DATA: u32 = 1u << 30u;
+const PARTICLE_STOPPED: u32 = 1u << 31u;
 
 struct SimSettings {
     num_steps: u32,
