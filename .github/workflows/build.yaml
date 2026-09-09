@@ -44,6 +44,16 @@ jobs:
           # Force the use of the Software Rasterizer
           VK_ICD_FILENAMES: /usr/share/vulkan/icd.d/lvp_icd.x86_64.json
         run: |
+          # The hosted runner may contain a stale Google Chrome source. Chrome
+          # is not required by this workflow, so remove it before refreshing
+          # the package indexes.
+          sudo find /etc/apt/sources.list.d -maxdepth 1 -type f \
+            \( -iname '*chrome*' -o -iname '*google*' \) -delete
+          if [ -f /etc/apt/sources.list ]; then
+            sudo sed -i '/dl\.google\.com\/linux\/chrome/d' /etc/apt/sources.list
+          fi
+          sudo find /var/lib/apt/lists -maxdepth 1 -type f \
+            \( -iname '*chrome*' -o -iname '*google*' \) -delete
           sudo apt-get update -qq
           sudo apt-get install -y -qq \
             libegl1-mesa-dev \
