@@ -146,7 +146,7 @@ impl SimSettings {
     pub fn new() -> Self {
         Self {
             max_steps: 6000,
-            sim_model: SimModel::Particle.as_int(),
+            sim_model: SimModel::TerrainFollowing.as_int(),
             friction_model: FrictionModel::Voellmy.as_int(),
             released_particles_per_cell: 8,
             grid_shape_x: 1,
@@ -391,23 +391,23 @@ impl<'de> Deserialize<'de> for FrictionModel {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SimModel {
-    Particle,
-    MPM,
+    TerrainFollowing,
+    Curvilinear,
 }
 
 impl SimModel {
     pub fn from_int(value: u32) -> Option<Self> {
         match value {
-            0 => Some(Self::Particle),
-            1 => Some(Self::MPM),
+            0 => Some(Self::TerrainFollowing),
+            1 => Some(Self::Curvilinear),
             _ => None,
         }
     }
 
     pub fn as_int(&self) -> u32 {
         match self {
-            Self::Particle => 0,
-            Self::MPM => 1,
+            Self::TerrainFollowing => 0,
+            Self::Curvilinear => 1,
         }
     }
 }
@@ -417,8 +417,8 @@ impl FromStr for SimModel {
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         match value.to_lowercase().as_str() {
-            "particle" => Ok(Self::Particle),
-            "mpm" => Ok(Self::MPM),
+            "terrain-following" | "terrain" | "t" => Ok(Self::TerrainFollowing),
+            "curvilinear" | "curvi" | "c" => Ok(Self::Curvilinear),
             _ => Err(format!("unknown simulation model: {value}")),
         }
     }
@@ -427,8 +427,8 @@ impl FromStr for SimModel {
 impl fmt::Display for SimModel {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
-            Self::Particle => "particle",
-            Self::MPM => "mpm",
+            Self::TerrainFollowing => "terrain-following",
+            Self::Curvilinear => "curvilinear",
         })
     }
 }
@@ -614,7 +614,7 @@ mod tests {
     fn test_simsettings_new_defaults() {
         let settings = SimSettings::new();
         assert_eq!(settings.max_steps, 6000);
-        assert_eq!(settings.sim_model, SimModel::Particle.as_int());
+        assert_eq!(settings.sim_model, SimModel::TerrainFollowing.as_int());
         assert_eq!(settings.friction_model, FrictionModel::Voellmy.as_int());
         assert_eq!(settings.released_particles_per_cell, 8);
         assert_eq!(settings.grid_shape_x, 1);
@@ -662,7 +662,7 @@ mod tests {
             outlines_path: Some("path/to/outlines".to_string()),
             outlines_padding: Some(10.0),
             max_steps: Some(42),
-            sim_model: Some(SimModel::MPM),
+            sim_model: Some(SimModel::Curvilinear),
             friction_model: Some(FrictionModel::VoellmyMinShear),
             released_particles_per_cell: Some(3),
             density: Some(123.4),
@@ -845,7 +845,7 @@ mod tests {
 
     #[test]
     fn sim_model_int_roundtrip() {
-        let models = [SimModel::Particle, SimModel::MPM];
+        let models = [SimModel::TerrainFollowing, SimModel::Curvilinear];
 
         for model in models {
             let value = model.as_int();
@@ -857,8 +857,8 @@ mod tests {
 
     #[test]
     fn sim_model_from_int() {
-        assert_eq!(SimModel::from_int(0), Some(SimModel::Particle));
-        assert_eq!(SimModel::from_int(1), Some(SimModel::MPM));
+        assert_eq!(SimModel::from_int(0), Some(SimModel::TerrainFollowing));
+        assert_eq!(SimModel::from_int(1), Some(SimModel::Curvilinear));
 
         assert_eq!(SimModel::from_int(2), None);
         assert_eq!(SimModel::from_int(u32::MAX), None);
@@ -866,7 +866,10 @@ mod tests {
 
     #[test]
     fn sim_model_string_roundtrip() {
-        let models = [(SimModel::Particle, "particle"), (SimModel::MPM, "mpm")];
+        let models = [
+            (SimModel::TerrainFollowing, "terrain-following"),
+            (SimModel::Curvilinear, "curvilinear"),
+        ];
 
         for (model, string) in models {
             assert_eq!(model.to_string(), string);
@@ -876,10 +879,12 @@ mod tests {
 
     #[test]
     fn sim_model_string_aliases() {
-        assert_eq!(SimModel::from_str("particle"), Ok(SimModel::Particle));
-
-        assert_eq!(SimModel::from_str("PARTICLE"), Ok(SimModel::Particle));
-        assert_eq!(SimModel::from_str("MPM"), Ok(SimModel::MPM));
+        for value in ["terrain-following", "terrain", "t", "TERRAIN"] {
+            assert_eq!(SimModel::from_str(value), Ok(SimModel::TerrainFollowing));
+        }
+        for value in ["curvilinear", "curvi", "c", "CURVI"] {
+            assert_eq!(SimModel::from_str(value), Ok(SimModel::Curvilinear));
+        }
     }
 
     #[test]

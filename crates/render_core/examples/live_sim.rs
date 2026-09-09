@@ -189,7 +189,7 @@ impl SimulationView {
     }
 
     fn current_model(&self) -> SimModel {
-        SimModel::from_int(self.simulation.settings.sim_model).unwrap_or(SimModel::Particle)
+        SimModel::from_int(self.simulation.settings.sim_model).unwrap_or(SimModel::TerrainFollowing)
     }
 
     /// Advances one time-gated step batch. Returns `true` when simulation state
@@ -358,7 +358,7 @@ fn start_simulation(settings_path: &str, exaggeration: f32) -> anyhow::Result<Si
     // let model = std::env::var("LIVE_SIM_MODEL")
     //     .ok()
     //     .and_then(|value| value.parse().ok())
-    //     .unwrap_or(SimModel::Particle);
+    //     .unwrap_or(SimModel::TerrainFollowing);
     // let settings = Settings {
     //     dem_path: Some(dem_path.to_string()),
     //     release_areas_path: Some(release_areas_path.clone()),
@@ -888,10 +888,14 @@ impl ApplicationHandler for Viewer {
                                     .show_ui(ui, |ui| {
                                         ui.selectable_value(
                                             &mut draft,
-                                            SimModel::Particle,
-                                            "particle",
+                                            SimModel::TerrainFollowing,
+                                            "Terrain-following",
                                         );
-                                        ui.selectable_value(&mut draft, SimModel::MPM, "mpm");
+                                        ui.selectable_value(
+                                            &mut draft,
+                                            SimModel::Curvilinear,
+                                            "Curvilinear",
+                                        );
                                     });
                             });
                             ui.add_enabled_ui(draft != current, |ui| {

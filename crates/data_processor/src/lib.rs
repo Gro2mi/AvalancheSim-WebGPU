@@ -1092,7 +1092,7 @@ mod tests {
             dem_path: Some(String::from("dem.png")),
             release_areas_path: Some(String::from("release_areas.png")),
             max_steps: Some(100),
-            sim_model: Some(SimModel::MPM),
+            sim_model: Some(SimModel::Curvilinear),
             friction_model: Some(FrictionModel::Voellmy),
             released_particles_per_cell: Some(3),
             density: Some(4.0),
@@ -1135,7 +1135,7 @@ mod tests {
             Some(String::from("release_areas.png"))
         );
         assert_eq!(loaded.max_steps, Some(100));
-        assert_eq!(loaded.sim_model, Some(SimModel::MPM));
+        assert_eq!(loaded.sim_model, Some(SimModel::Curvilinear));
         assert_eq!(loaded.friction_model, Some(FrictionModel::Voellmy));
         assert_eq!(loaded.released_particles_per_cell, Some(3));
         assert_eq!(loaded.density, Some(4.0));

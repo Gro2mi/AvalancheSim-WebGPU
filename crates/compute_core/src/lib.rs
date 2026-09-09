@@ -1657,7 +1657,7 @@ impl ComputeOrchestrator {
         .await
     }
 
-    pub async fn step_mpm(&mut self, steps: u32) -> Result<SimInfo> {
+    pub async fn step_curvilinear(&mut self, steps: u32) -> Result<SimInfo> {
         self.step_simulation(steps, SimModel::MPM).await
     }
 
@@ -1682,7 +1682,7 @@ impl ComputeOrchestrator {
             let steps = self
                 .batch_compute_steps
                 .min(sim_settings.max_steps - steps_run);
-            let sim_info = self.step_mpm(steps).await?;
+            let sim_info = self.step_curvilinear(steps).await?;
             steps_run += steps;
             let flags = sim_info.parsed_flags();
             if !flags.is_empty() {

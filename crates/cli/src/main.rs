@@ -374,7 +374,7 @@ mod tests {
         let mut settings = Settings::default();
         settings.max_steps = Some(10);
         settings.density = Some(123.4);
-        settings.sim_model = Some(SimModel::Particle);
+        settings.sim_model = Some(SimModel::TerrainFollowing);
         settings.friction_model = Some(FrictionModel::Voellmy);
         settings.enable_curvature = Some(false);
 
@@ -383,7 +383,7 @@ mod tests {
             about: false,
             list_devices: false,
             max_steps: Some(42),
-            sim_model: Some(SimModel::Particle),
+            sim_model: Some(SimModel::TerrainFollowing),
             friction_model: Some(FrictionModel::Coulomb),
             density: Some(456.7),
             enable_curvature: Some(true),

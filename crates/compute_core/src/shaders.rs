@@ -52,7 +52,19 @@ macro_rules! define_shaders {
                     tracing::debug!("Loading shader source for {:?} from disk", self);
                     let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
                         .join("src").join("shaders").join(format!("{}.wgsl", self.to_str()));
-                    std::fs::read_to_string(&path).expect("Shader file missing")
+                    match std::fs::read_to_string(&path) {
+                        Ok(source) => source,
+                        Err(error) => {
+                            tracing::warn!(
+                                ?path,
+                                ?error,
+                                "Shader file was not available on disk; using embedded source"
+                            );
+                            match self {
+                                $(ShaderName::$variant => include_str!(concat!("shaders/", $filename, ".wgsl")).to_string()),*
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -675,7 +687,7 @@ pub fn create_shader_configs(
                 (
                     BufferName::SimInfo.to_string(),
                     BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: false },
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
                         has_dynamic_offset: false,
                         min_binding_size: None,
                     },
@@ -1151,7 +1163,7 @@ pub fn create_shader_configs(
                 ),
                 // Binding 6:
                 (
-                    BufferName::ParticlesStopped.to_string(),
+                    BufferName::ParticlesState.to_string(),
                     BindingType::Buffer {
                         ty: BufferBindingType::Storage { read_only: false },
                         has_dynamic_offset: false,
@@ -1326,7 +1338,7 @@ pub fn create_shader_configs(
                 ),
                 // Binding 10:
                 (
-                    BufferName::ParticlesStopped.to_string(),
+                    BufferName::ParticlesState.to_string(),
                     BindingType::Buffer {
                         ty: BufferBindingType::Storage { read_only: false },
                         has_dynamic_offset: false,
@@ -1569,89 +1581,6 @@ pub fn create_shader_configs(
         )?,
     );
     shader_configs.insert(
-        ShaderName::P2GMPM,
-        ComputeShaderConfig::new_with_constants(
-            device,
-            ShaderName::P2GMPM,
-            load_shader_source(ShaderName::P2GMPM, has_float32_atomic),
-            &[
-                // Binding 0:
-                (
-                    BufferName::SimSettings.to_string(),
-                    BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                ),
-                // Binding 1:
-                (
-                    BufferName::SimInfo.to_string(),
-                    BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: false },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                ),
-                // Binding 2:
-                (
-                    BufferName::ParticlesPosition.to_string(),
-                    BindingType::Buffer {
-                        ty: BufferBindingType::Storage { read_only: true },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                ),
-                // Binding 3:
-                (
-                    BufferName::ParticlesVelocity.to_string(),
-                    BindingType::Buffer {
-                        ty: BufferBindingType::Storage { read_only: true },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                ),
-                // Binding 4:
-                (
-                    BufferName::ParticlesMass.to_string(),
-                    BindingType::Buffer {
-                        ty: BufferBindingType::Storage { read_only: true },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                ),
-                // Binding 5:
-                (
-                    BufferName::GridMass.to_string(),
-                    BindingType::Buffer {
-                        ty: BufferBindingType::Storage { read_only: false },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                ),
-                // Binding 6:
-                (
-                    BufferName::GridMomentum.to_string(),
-                    BindingType::Buffer {
-                        ty: BufferBindingType::Storage { read_only: false },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                ),
-                // Binding 7:
-                (
-                    BufferName::ParticlesAffineMatrix.to_string(),
-                    BindingType::Buffer {
-                        ty: BufferBindingType::Storage { read_only: true },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                ),
-            ],
-            &[("WG_SIZE_1D", max_compute_invocations_per_workgroup as f64)],
-        )?,
-    );
-    shader_configs.insert(
         ShaderName::GridPhysics,
         ComputeShaderConfig::new(
             device,
@@ -1756,11 +1685,11 @@ pub fn create_shader_configs(
         )?,
     );
     shader_configs.insert(
-        ShaderName::GridPhysicsMPM,
+        ShaderName::GridPhysicsCurvilinear,
         ComputeShaderConfig::new(
             device,
-            ShaderName::GridPhysicsMPM,
-            load_shader_source(ShaderName::GridPhysicsMPM, has_float32_atomic),
+            ShaderName::GridPhysicsCurvilinear,
+            load_shader_source(ShaderName::GridPhysicsCurvilinear, has_float32_atomic),
             &[
                 // Binding 0:
                 (

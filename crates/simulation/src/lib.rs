@@ -617,7 +617,7 @@ impl Simulation {
 
         if self.state != SimulationState::Running {
             match self.settings.sim_model {
-                model if model == SimModel::Particle.as_int() => {
+                model if model == SimModel::TerrainFollowing.as_int() => {
                     self.orchestrator
                         .prepare_compute_particles(
                             &self.settings,
@@ -626,7 +626,7 @@ impl Simulation {
                         )
                         .await?;
                 }
-                model if model == SimModel::MPM.as_int() => {
+                model if model == SimModel::Curvilinear.as_int() => {
                     self.orchestrator
                         .prepare_mpm(
                             &self.settings,
@@ -656,10 +656,12 @@ impl Simulation {
 
         self.gpu_cache.reset_simulation_result();
         self.sim_info = match self.settings.sim_model {
-            model if model == SimModel::Particle.as_int() => {
-                self.orchestrator.step_compute_particles(steps).await?
+            model if model == SimModel::TerrainFollowing.as_int() => {
+                self.orchestrator.step_terrain_following(steps).await?
             }
-            model if model == SimModel::MPM.as_int() => self.orchestrator.step_mpm(steps).await?,
+            model if model == SimModel::Curvilinear.as_int() => {
+                self.orchestrator.step_curvilinear(steps).await?
+            }
             _ => bail!("Unsupported simulation model: {}", self.settings.sim_model),
         };
 
@@ -1500,7 +1502,7 @@ impl Simulation {
         }
         if self.gpu_cache.particles_velocity_z.is_none() {
             self.gpu_cache.read_count += 1;
-            if self.settings.sim_model == SimModel::MPM.as_int() {
+            if self.settings.sim_model == SimModel::Curvilinear.as_int() {
                 self.gpu_cache.particles_velocity_z =
                     Some(vec![0.0; self.number_particles as usize]);
             } else {
@@ -3000,7 +3002,7 @@ mod tests {
     #[test_log::test]
     fn test_mpm_velocity_z_is_synthetic_zero() {
         let mut sim = setup_simple_sim(40.0, 3.0);
-        sim.settings.sim_model = SimModel::MPM.as_int();
+        sim.settings.sim_model = SimModel::Curvilinear.as_int();
         block_on(sim.prepare()).expect("Failed to prepare MPM simulation");
         let number_particles = sim.number_particles as usize;
 
@@ -3188,7 +3190,7 @@ mod tests {
             ),
             cfl: Some(0.5),
             max_steps: Some(6000),
-            sim_model: Some(SimModel::Particle),
+            sim_model: Some(SimModel::TerrainFollowing),
             ..Default::default()
         };
         block_on(sim.create(settings)).expect("Failed to create simulation");

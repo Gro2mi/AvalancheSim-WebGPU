@@ -17,7 +17,7 @@ fn p2g(@builtin(global_invocation_id) id: vec3u) {
         return;
     }    
     let use_particle_interaction: bool = (sim_settings.flags & (1u << 1u)) != 0u;
-    if !use_particle_interaction {
+    if sim_settings.model_type == 0 && !use_particle_interaction {
         return;
     }
     let cell = position_to_cell(particles_position[id.x].xy);
@@ -113,8 +113,8 @@ const SIM_INFO_STOPPED: u32 = 1u << 31u;
 const SIM_INFO_ALL_PARTICLES_STOPPED: u32 = 1u << 30u;
 const SIM_INFO_NO_NEW_CELLS: u32 = 1u << 29u;
 
-const PARTICLE_FLYING: u32 = 27u << 0u;
-const PARTICLE_OUT_OF_BOUNDS: u32 = 28u << 0u;
+const PARTICLE_FLYING: u32 = 1u << 27u;
+const PARTICLE_OUT_OF_BOUNDS: u32 = 1u << 28u;
 const PARTICLE_IS_NAN: u32 = 1u << 29u;
 const PARTICLE_OUT_OF_DEM_DATA: u32 = 1u << 30u;
 const PARTICLE_STOPPED: u32 = 1u << 31u;
