@@ -139,7 +139,7 @@ fn clone_particle_buffers(
     let get = |name: BufferName| orchestrator.resources.get_buffer(&name).cloned();
     let position = get(BufferName::ParticlesPosition)?;
     let velocity = get(BufferName::ParticlesVelocity)?;
-    let stopped = get(BufferName::ParticlesStopped)?;
+    let state = get(BufferName::ParticlesState)?;
     let elevation = get(BufferName::ParticlesElevation)?;
     let velocity_z = get(BufferName::ParticlesVelocityZ).unwrap_or_else(|| {
         tracing::debug!("no vertical velocity buffer; colouring by horizontal speed");
@@ -152,7 +152,7 @@ fn clone_particle_buffers(
             })
     });
 
-    Some([position, velocity, velocity_z, stopped, elevation])
+    Some([position, velocity, velocity_z, state, elevation])
 }
 
 /// The canvas surface plus the renderer watching the simulation's GPU buffers.
