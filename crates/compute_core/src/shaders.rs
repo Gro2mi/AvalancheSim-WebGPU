@@ -81,14 +81,14 @@ define_shaders! {
     ChamferPrepare => "chamfer_prepare",
     ChamferFlood => "chamfer_flood",
     ChamferReduce => "chamfer_reduce",
+    ComputeBeelineDistance => "compute_beeline_distance",
     EvaluateMassMovement => "evaluate_mass_movement",
     EvaluateMassMovementPoints => "evaluate_mass_movement_points",
     InitializeParticles => "initialize_particles",
     ComputeParticles => "compute_particles",
     G2P => "g2p",
-    P2GMPM => "p2g_mpm",
     P2G => "p2g",
-    GridPhysicsMPM => "grid_physics_mpm",
+    GridPhysicsCurvilinear => "grid_physics_curvilinear",
     GridPhysics => "grid_physics",
     Utils => "utils",
     Random => "random",
@@ -575,7 +575,7 @@ pub fn create_shader_configs(
                     },
                 ),
                 (
-                    BufferName::EvaluationCounts.to_string(),
+                    BufferName::EvaluationResult.to_string(),
                     BindingType::Buffer {
                         ty: BufferBindingType::Storage { read_only: false },
                         has_dynamic_offset: false,
@@ -628,7 +628,7 @@ pub fn create_shader_configs(
                     },
                 ),
                 (
-                    BufferName::EvaluationCounts.to_string(),
+                    BufferName::EvaluationResult.to_string(),
                     BindingType::Buffer {
                         ty: BufferBindingType::Storage { read_only: false },
                         has_dynamic_offset: false,
@@ -711,6 +711,52 @@ pub fn create_shader_configs(
                 // Binding 6:
                 (
                     BufferName::AtomicValues.to_string(),
+                    BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: false },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                ),
+
+    shader_configs.insert(
+        ShaderName::ComputeBeelineDistance,
+        ComputeShaderConfig::new(
+            device,
+            ShaderName::ComputeBeelineDistance,
+            load_shader_source(ShaderName::ComputeBeelineDistance, has_float32_atomic),
+            &[
+                // Binding 0:
+                (
+                    BufferName::SimSettings.to_string(),
+                    BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                ),
+                // Binding 1:
+                (
+                    BufferName::GridPeakFlowThickness.to_string(),
+                    BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                ),
+                // Binding 2:
+                (
+                    TextureName::Dem.to_string(),
+                    BindingType::Texture {
+                        multisampled: false,
+                        view_dimension: TextureViewDimension::D2,
+                        sample_type: wgpu::TextureSampleType::Float {
+                            filterable: has_float32_filterable,
+                        },
+                    },
+                ),
+                // Binding 3:
+                (
+                    BufferName::EvaluationResult.to_string(),
                     BindingType::Buffer {
                         ty: wgpu::BufferBindingType::Storage { read_only: false },
                         has_dynamic_offset: false,
@@ -896,7 +942,7 @@ pub fn create_shader_configs(
                 ),
                 // Binding 5:
                 (
-                    BufferName::ChamferDistance.to_string(),
+                    BufferName::EvaluationResult.to_string(),
                     BindingType::Buffer {
                         ty: wgpu::BufferBindingType::Storage { read_only: false },
                         has_dynamic_offset: false,

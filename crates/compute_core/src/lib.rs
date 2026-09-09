@@ -1,14 +1,12 @@
 use crate::buffers::{
-    AtomicValues, BufferName, CenterOfMassResult, ChamferDistanceResult, ChamferParams,
-    GpuResources, TextureName, create_buffers_and_texture_descriptions,
+    AtomicValues, BufferName, CenterOfMassResult, ChamferParams, EvaluationResult, GpuResources,
+    TextureName, create_buffers_and_texture_descriptions,
 };
 use crate::settings::SimModel;
 use crate::shaders::{ComputeShaderConfig, ShaderName, generate_shader_report};
 use crate::utils::timer_checkpoint;
 use anyhow::{Context, Result, anyhow};
-use evaluation::{
-    ChamferDistance, MassMovementEvaluation, chamfer_from_sums, evaluation_from_counts,
-};
+use evaluation::{MassMovementEvaluation, chamfer_from_sums, evaluation_from_counts};
 use std::cmp::min;
 use std::collections::HashMap;
 use std::hash::Hash;
@@ -1012,13 +1010,15 @@ impl ComputeOrchestrator {
     /// jump flooding algorithm (one dispatch per power-of-two step size), and
     /// reduces the distances in a single workgroup. The result distances are
     /// normalized by the length of the grid diagonal in world units.
-    pub async fn run_compute_chamfer_distance(
+    /// Dispatches the chamfer distance pipeline: seeds two nearest-neighbor
+    /// fields, propagates the nearest seeds with the jump flooding algorithm
+    /// (one dispatch per power-of-two step size) and reduces the distances
+    /// into the chamfer section of the unified EvaluationResult buffer.
+    /// Requires SimSettings and the EvaluationResult buffer to be initialized.
+    async fn dispatch_chamfer_distance(
         &mut self,
         sim_settings: &settings::SimSettings,
-    ) -> Result<ChamferDistance> {
-        if sim_settings.grid_shape_x == 0 || sim_settings.grid_shape_y == 0 {
-            return Err(anyhow!("Grid must not be empty"));
-        }
+    ) -> Result<()> {
         let cell_count = usize::try_from(sim_settings.grid_shape_x)
             .ok()
             .and_then(|width| {
@@ -1047,17 +1047,6 @@ impl ComputeOrchestrator {
             size_of::<ChamferParams>(),
             BufferUsages::UNIFORM | BufferUsages::COPY_DST,
         );
-        self.add_buffer(
-            BufferName::ChamferDistance,
-            size_of::<ChamferDistanceResult>(),
-            BufferUsages::STORAGE | BufferUsages::COPY_SRC,
-        );
-
-        self.resources.write_buffer(
-            &self.queue,
-            BufferName::SimSettings,
-            sim_settings.as_bytes(),
-        )?;
 
         let dispatch_x = sim_settings.grid_shape_x.div_ceil(WORKGROUP_SIZE_2D);
         let dispatch_y = sim_settings.grid_shape_y.div_ceil(WORKGROUP_SIZE_2D);
@@ -1097,24 +1086,7 @@ impl ComputeOrchestrator {
         }
 
         self.run_shader(&ShaderName::ChamferReduce, 1, 1, 1).await?;
-
-        let raw = self
-            .read_buffer::<ChamferDistanceResult>(BufferName::ChamferDistance)
-            .await?;
-        let raw = raw
-            .first()
-            .ok_or_else(|| anyhow!("ChamferDistance buffer was empty"))?;
-        let diagonal = (((sim_settings.grid_shape_x as f64) * (sim_settings.cell_size as f64))
-            .powi(2)
-            + ((sim_settings.grid_shape_y as f64) * (sim_settings.cell_size as f64)).powi(2))
-        .sqrt();
-        Ok(chamfer_from_sums(
-            raw.sum_sim_to_roi,
-            raw.count_sim,
-            raw.sum_roi_to_sim,
-            raw.count_roi,
-            diagonal,
-        ))
+        Ok(())
     }
 
     /// Copies the full contents of one named buffer into another on the GPU.
@@ -1138,6 +1110,16 @@ impl ComputeOrchestrator {
         Ok(())
     }
 
+    /// Evaluates the simulation against the region of interest on the GPU.
+    ///
+    /// Dispatches the mass movement count shaders, the chamfer distance
+    /// pipeline and the beeline distance shader, which all write into the
+    /// unified EvaluationResult buffer. The buffer is read back once and the
+    /// metrics combined into a single MassMovementEvaluation:
+    /// - intersection/undershoot/overshoot/iou from the simulated vs. reference cell counts
+    /// - beeline_3d between the highest and lowest avalanche point
+    /// - chamfer between the simulated cells and the region of interest,
+    ///   normalized with the length of the grid diagonal
     pub async fn evaluate_gpu(
         &mut self,
         sim_settings: &settings::SimSettings,
@@ -1152,8 +1134,13 @@ impl ComputeOrchestrator {
         )?;
         self.resources.write_buffer(
             &self.queue,
-            BufferName::EvaluationCounts,
-            &[0, 0, 0, 0, u32::MAX, 0, u32::MAX, u32::MAX],
+            BufferName::EvaluationResult,
+            &[EvaluationResult {
+                min_elevation: u32::MAX,
+                min_cell: u32::MAX,
+                max_cell: u32::MAX,
+                ..Default::default()
+            }],
         )?;
 
         let dispatch_x = sim_settings.grid_shape_x.div_ceil(WORKGROUP_SIZE_2D);
@@ -1167,24 +1154,30 @@ impl ComputeOrchestrator {
             1,
         )
         .await?;
-
-        let counts = self
-            .read_buffer::<u32>(BufferName::EvaluationCounts)
+        self.dispatch_chamfer_distance(sim_settings).await?;
+        self.run_shader(&ShaderName::ComputeBeelineDistance, 1, 1, 1)
             .await?;
-        let mut evaluation = evaluation_from_counts(counts[0], counts[1], counts[2]);
-        if counts[6] != u32::MAX && counts[7] != u32::MAX {
-            let min_x = counts[6] % sim_settings.grid_shape_x;
-            let min_y = counts[6] / sim_settings.grid_shape_x;
-            let max_x = counts[7] % sim_settings.grid_shape_x;
-            let max_y = counts[7] / sim_settings.grid_shape_x;
-            let dx = (max_x as f64 - min_x as f64) * sim_settings.cell_size as f64;
-            let dy = (max_y as f64 - min_y as f64) * sim_settings.cell_size as f64;
-            let min_elevation = ordered_u32_to_f32(counts[4]) as f64;
-            let max_elevation = ordered_u32_to_f32(counts[5]) as f64;
-            let dz = max_elevation - min_elevation;
-            evaluation.beeline_distance_3d = (dx * dx + dy * dy + dz * dz).sqrt();
-        }
-        Ok(evaluation)
+
+        let raw = self
+            .read_buffer::<EvaluationResult>(BufferName::EvaluationResult)
+            .await?;
+        let raw = raw
+            .first()
+            .ok_or_else(|| anyhow!("EvaluationResult buffer was empty"))?;
+        let mut evaluation =
+            evaluation_from_counts(raw.intersection, raw.undershoot, raw.overshoot);
+        evaluation.beeline_3d = raw.beeline_distance as f64;
+        let diagonal = (((sim_settings.grid_shape_x as f64) * (sim_settings.cell_size as f64))
+            .powi(2)
+            + ((sim_settings.grid_shape_y as f64) * (sim_settings.cell_size as f64)).powi(2))
+        .sqrt();
+        Ok(evaluation.with_chamfer(chamfer_from_sums(
+            raw.sum_sim_to_roi,
+            raw.count_sim,
+            raw.sum_roi_to_sim,
+            raw.count_roi,
+            diagonal,
+        )))
     }
 
     pub async fn run_initialize_particles(
@@ -1336,8 +1329,11 @@ impl ComputeOrchestrator {
         }
         let max_timesteps =
             usize::try_from(sim_settings.max_steps).context("max_steps does not fit in usize")?;
+        // the center-of-mass shader writes the slot with the index of the
+        // current sim_info.timestep, which runs from 1 to max_steps inclusive,
+        // so slot 0 is unused and max_steps + 1 slots are needed
         let center_of_mass_buffer_bytes: Vec<CenterOfMassResult> =
-            vec![CenterOfMassResult::default(); max_timesteps];
+            vec![CenterOfMassResult::default(); max_timesteps + 1];
         self.add_buffer_with_data(
             BufferName::CenterOfMass,
             &center_of_mass_buffer_bytes,
@@ -1382,8 +1378,8 @@ impl ComputeOrchestrator {
                 ShaderName::ComputeParticles,
             ),
             1 => (
-                ShaderName::P2GMPM,
-                ShaderName::GridPhysicsMPM,
+                ShaderName::P2G,
+                ShaderName::GridPhysicsCurvilinear,
                 ShaderName::G2P,
             ),
             2_u32..=u32::MAX => {
@@ -1549,8 +1545,9 @@ impl ComputeOrchestrator {
             .ok_or_else(|| anyhow!("SimInfo buffer was empty"))
     }
 
-    pub async fn step_compute_particles(&mut self, steps: u32) -> Result<SimInfo> {
-        self.step_simulation(steps, SimModel::Particle).await
+    pub async fn step_terrain_following(&mut self, steps: u32) -> Result<SimInfo> {
+        self.step_simulation(steps, SimModel::TerrainFollowing)
+            .await
     }
 
     pub async fn run_compute_particles(
@@ -1574,7 +1571,7 @@ impl ComputeOrchestrator {
             let steps = self
                 .batch_compute_steps
                 .min(sim_settings.max_steps - steps_run);
-            let sim_info = self.step_compute_particles(steps).await?;
+            let sim_info = self.step_terrain_following(steps).await?;
             steps_run += steps;
             let flags = sim_info.parsed_flags();
             if !flags.is_empty() {
@@ -1658,7 +1655,7 @@ impl ComputeOrchestrator {
     }
 
     pub async fn step_curvilinear(&mut self, steps: u32) -> Result<SimInfo> {
-        self.step_simulation(steps, SimModel::MPM).await
+        self.step_simulation(steps, SimModel::Curvilinear).await
     }
 
     pub async fn run_mpm(
@@ -1757,6 +1754,21 @@ mod tests {
     use pollster::block_on;
 
     #[test]
+    fn particle_state_decodes_status_bits_and_timestep() {
+        let state = (37u32) | PARTICLE_FLYING | PARTICLE_OUT_OF_BOUNDS | PARTICLE_STOPPED;
+
+        let parsed = ParticleState::from(state);
+
+        assert!(parsed.flying);
+        assert!(parsed.out_of_bounds);
+        assert!(parsed.stopped);
+        assert!(!parsed.is_nan);
+        assert!(!parsed.out_of_dem_data);
+        assert!(!parsed.naturally_stopped);
+        assert_eq!(parsed.timestep, 37);
+    }
+
+    #[test]
     fn sim_info_flags_pretty_print_known_flags() {
         let flags = SimInfoFlags::from(
             SimInfoFlags::OUT_OF_BOUNDS.bits()
@@ -1822,8 +1834,8 @@ mod tests {
                 ShaderName::ComputeReleaseAreas,
                 ShaderName::InitializeParticles,
                 ShaderName::ResetGrid,
-                ShaderName::P2GMPM,
-                ShaderName::GridPhysicsMPM,
+                ShaderName::P2G,
+                ShaderName::GridPhysicsCurvilinear,
                 ShaderName::G2P,
                 ShaderName::UpdateSimInfo,
             ],
@@ -1905,26 +1917,26 @@ mod tests {
 
         let actual = block_on(orchestrator.evaluate_gpu(&settings)).expect("GPU evaluation failed");
 
-        assert_eq!(actual.alpha, expected.alpha);
-        assert_eq!(actual.beta, expected.beta);
-        assert_eq!(actual.gamma, expected.gamma);
-        assert_eq!(actual.jaccard, expected.jaccard);
+        assert_eq!(actual.intersection, expected.intersection);
+        assert_eq!(actual.undershoot, expected.undershoot);
+        assert_eq!(actual.overshoot, expected.overshoot);
+        assert_eq!(actual.iou, expected.iou);
         let expected_distance = 66.0f64.sqrt();
         println!("Expected distance: {}", expected_distance);
-        println!("Actual distance: {}", actual.beeline_distance_3d);
+        println!("Actual distance: {}", actual.beeline_3d);
         // TODO not correctly implemented yet
-        // assert!((actual.beeline_distance_3d - expected_distance).abs() < 1e-7);
+        // assert!((actual.beeline_3d - expected_distance).abs() < 1e-7);
 
         block_on(orchestrator.write_buffer(BufferName::GridPeakFlowThickness, &[1.0f32; 6]))
             .expect("Failed to reset peak flow thicknesses");
         let empty_simulation = block_on(orchestrator.evaluate_gpu(&settings))
             .expect("GPU evaluation without affected cells failed");
-        assert_eq!(empty_simulation.beeline_distance_3d, 0.0);
+        assert_eq!(empty_simulation.beeline_3d, 0.0);
     }
 
     #[test_log::test]
     fn test_compute_center_of_mass() {
-        let settings = settings::SimSettings {
+        let mut settings = settings::SimSettings {
             grid_shape_x: 3,
             grid_shape_y: 2,
             cell_size: 5.0,
@@ -2025,7 +2037,209 @@ mod tests {
     }
 
     #[test_log::test]
-    fn test_compute_chamfer_distance() {
+    fn test_center_of_mass_serpentine_timing() {
+        // 512x512 grid with a 1-cell-wide serpentine blob of ~130k cells,
+        // the worst case for label propagation along a sinuous path.
+        let settings = settings::SimSettings {
+            grid_shape_x: 512,
+            grid_shape_y: 512,
+            cell_size: 1.0,
+            ..Default::default()
+        };
+        let mut orchestrator =
+            block_on(ComputeOrchestrator::new()).expect("Failed to create ComputeOrchestrator");
+        orchestrator
+            .create_buffers_and_texture_descriptions(&settings)
+            .expect("Failed to create GPU resources");
+        orchestrator.add_buffer_with_data(
+            BufferName::CenterOfMass,
+            &[CenterOfMassResult::default(); 3],
+            BufferUsages::STORAGE | BufferUsages::COPY_DST | BufferUsages::COPY_SRC,
+        );
+        orchestrator.add_buffer(
+            BufferName::SimInfo,
+            size_of::<SimInfo>(),
+            BufferUsages::STORAGE | BufferUsages::COPY_DST | BufferUsages::COPY_SRC,
+        );
+        orchestrator.add_buffer(
+            BufferName::AtomicValues,
+            ((size_of::<AtomicValues>() - 1) / 16 + 1) * 16,
+            BufferUsages::STORAGE | BufferUsages::COPY_DST | BufferUsages::COPY_SRC,
+        );
+        orchestrator
+            .resources
+            .add_texture_with_data(
+                &orchestrator.device,
+                &orchestrator.queue,
+                &[0.0f32; 512 * 512],
+                TextureName::Dem,
+                Extent3d {
+                    width: 512,
+                    height: 512,
+                    depth_or_array_layers: 1,
+                },
+                TextureFormat::R32Float,
+                TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST,
+            )
+            .expect("Failed to upload DEM");
+        block_on(orchestrator.write_buffer(
+            BufferName::SimInfo,
+            &[SimInfo {
+                timestep: 2,
+                ..Default::default()
+            }],
+        ))
+        .expect("Failed to write sim info");
+
+        // serpentine path: full rows, alternating direction
+        let mut masses = vec![0.0f32; 512 * 512];
+        for (row, chunk) in masses.chunks_mut(512).enumerate() {
+            if row % 2 == 0 {
+                chunk.fill(1.0);
+            } else {
+                chunk[1..511].fill(1.0);
+            }
+        }
+        let mass_factor = if orchestrator.has_float32_atomic() {
+            1.0
+        } else {
+            10.0
+        };
+        if orchestrator.has_float32_atomic() {
+            block_on(orchestrator.write_buffer(BufferName::GridMass, &masses))
+                .expect("Failed to write grid mass");
+        } else {
+            let encoded: Vec<u32> = masses.iter().map(|&m| (m * mass_factor) as u32).collect();
+            block_on(orchestrator.write_buffer(BufferName::GridMass, &encoded))
+                .expect("Failed to write grid mass");
+        }
+
+        // warmup
+        block_on(orchestrator.run_compute_center_of_mass(&settings))
+            .expect("GPU center of mass failed");
+        let runs = 10;
+        let started = std::time::Instant::now();
+        for _ in 0..runs {
+            block_on(orchestrator.run_compute_center_of_mass(&settings))
+                .expect("GPU center of mass failed");
+        }
+        let elapsed = started.elapsed();
+        println!(
+            "serpentine center of mass: {:?} per run ({} runs)",
+            elapsed / runs,
+            runs
+        );
+
+        // the serpentine is one connected blob
+        let expected_total = 256.0f32 * 512.0 + 256.0 * 510.0;
+        let stored =
+            block_on(orchestrator.read_buffer::<CenterOfMassResult>(BufferName::CenterOfMass))
+                .expect("Failed to read center of mass");
+        assert!(
+            (stored[2].total_mass - expected_total).abs() < 1.0,
+            "total mass was {}, expected {}",
+            stored[2].total_mass,
+            expected_total
+        );
+
+        // comparison: one compact blob (fully labeled grid, min label 0)
+        let mut compact = vec![1.0f32; 512 * 512];
+        compact[0] = 0.0;
+        if orchestrator.has_float32_atomic() {
+            block_on(orchestrator.write_buffer(BufferName::GridMass, &compact))
+                .expect("Failed to write grid mass");
+        } else {
+            let encoded: Vec<u32> = compact.iter().map(|&m| (m * mass_factor) as u32).collect();
+            block_on(orchestrator.write_buffer(BufferName::GridMass, &encoded))
+                .expect("Failed to write grid mass");
+        }
+        block_on(orchestrator.run_compute_center_of_mass(&settings))
+            .expect("GPU center of mass failed");
+        let started = std::time::Instant::now();
+        for _ in 0..runs {
+            block_on(orchestrator.run_compute_center_of_mass(&settings))
+                .expect("GPU center of mass failed");
+        }
+        println!(
+            "compact center of mass:    {:?} per run ({} runs)",
+            started.elapsed() / runs,
+            runs
+        );
+    }
+
+    #[test_log::test]
+    fn test_evaluate_gpu_beeline_distance() {
+        // 3x3 grid with cell_size 5. Avalanche cells (thickness 2.0 > 1.0) are
+        // (0,0) at 100 m, (1,1) at 70 m and (2,2) at 40 m. Cell (0,2) is the
+        // highest point of the DEM (9999 m) but not part of the avalanche.
+        // Highest avalanche point (2.5, 2.5, 100), lowest (12.5, 12.5, 40):
+        // distance = sqrt(10^2 + 10^2 + 60^2) = sqrt(3800)
+        let settings = settings::SimSettings {
+            grid_shape_x: 3,
+            grid_shape_y: 3,
+            cell_size: 5.0,
+            peak_flow_thickness_threshold: 1.0,
+            ..Default::default()
+        };
+        let mut orchestrator =
+            block_on(ComputeOrchestrator::new()).expect("Failed to create ComputeOrchestrator");
+        orchestrator
+            .create_buffers_and_texture_descriptions(&settings)
+            .expect("Failed to create GPU resources");
+        orchestrator
+            .resources
+            .add_texture_with_data(
+                &orchestrator.device,
+                &orchestrator.queue,
+                &[100.0f32, 50.0, 50.0, 50.0, 70.0, 50.0, 9999.0, 50.0, 40.0],
+                TextureName::Dem,
+                Extent3d {
+                    width: 3,
+                    height: 3,
+                    depth_or_array_layers: 1,
+                },
+                TextureFormat::R32Float,
+                TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST,
+            )
+            .expect("Failed to upload DEM");
+        block_on(orchestrator.write_buffer(
+            BufferName::GridPeakFlowThickness,
+            &[2.0f32, 0.0, 0.0, 0.0, 2.0, 0.0, 0.0, 0.0, 2.0],
+        ))
+        .expect("Failed to write peak flow thicknesses");
+        block_on(orchestrator.write_buffer(BufferName::RegionOfInterest, &[0u32]))
+            .expect("Failed to write region of interest");
+
+        let result = block_on(orchestrator.evaluate_gpu(&settings)).expect("GPU evaluation failed");
+        let expected = 3800.0f64.sqrt();
+        assert!(
+            (result.beeline_3d - expected).abs() < 1e-3,
+            "beeline distance was {}, expected {}",
+            result.beeline_3d,
+            expected
+        );
+
+        // the beeline section of the unified result buffer keeps the paired
+        // extreme cells and elevations
+        let raw = block_on(
+            orchestrator.read_buffer::<buffers::EvaluationResult>(BufferName::EvaluationResult),
+        )
+        .expect("Failed to read evaluation result");
+        assert_eq!(raw[0].beeline_max_cell, 0, "highest avalanche cell");
+        assert_eq!(raw[0].beeline_min_cell, 8, "lowest avalanche cell");
+        assert_eq!(raw[0].beeline_max_elevation, 100.0);
+        assert_eq!(raw[0].beeline_min_elevation, 40.0);
+
+        // without avalanche cells there are no extreme points
+        block_on(orchestrator.write_buffer(BufferName::GridPeakFlowThickness, &[0.0f32; 9]))
+            .expect("Failed to reset peak flow thicknesses");
+        let empty = block_on(orchestrator.evaluate_gpu(&settings))
+            .expect("GPU evaluation without avalanche cells failed");
+        assert_eq!(empty.beeline_3d, 0.0);
+    }
+
+    #[test_log::test]
+    fn test_evaluate_gpu_chamfer_distance() {
         // 3x3 grid with cell_size 5: a simulated cell at (2,0) and ROI cells at
         // (0,0) and (2,2). Every nearest distance is 2 cells = 10 world units,
         // the grid diagonal is 15*sqrt(2).
@@ -2041,6 +2255,22 @@ mod tests {
         orchestrator
             .create_buffers_and_texture_descriptions(&settings)
             .expect("Failed to create GPU resources");
+        orchestrator
+            .resources
+            .add_texture_with_data(
+                &orchestrator.device,
+                &orchestrator.queue,
+                &[50.0f32; 9],
+                TextureName::Dem,
+                Extent3d {
+                    width: 3,
+                    height: 3,
+                    depth_or_array_layers: 1,
+                },
+                TextureFormat::R32Float,
+                TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST,
+            )
+            .expect("Failed to upload DEM");
         block_on(orchestrator.write_buffer(
             BufferName::GridPeakFlowThickness,
             &[0.0f32, 0.0, 2.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
@@ -2049,8 +2279,7 @@ mod tests {
         block_on(orchestrator.write_buffer(BufferName::RegionOfInterest, &[0b1_0000_0001u32]))
             .expect("Failed to write region of interest");
 
-        let result = block_on(orchestrator.run_compute_chamfer_distance(&settings))
-            .expect("GPU chamfer distance failed");
+        let result = block_on(orchestrator.evaluate_gpu(&settings)).expect("GPU evaluation failed");
 
         let expected_per_direction = 10.0 / (15.0 * (2.0f64).sqrt());
         assert!(
@@ -2073,8 +2302,8 @@ mod tests {
         // so the chamfer distance is infinite
         block_on(orchestrator.write_buffer(BufferName::GridPeakFlowThickness, &[0.0f32; 9]))
             .expect("Failed to reset peak flow thicknesses");
-        let empty_simulation = block_on(orchestrator.run_compute_chamfer_distance(&settings))
-            .expect("GPU chamfer distance without simulated cells failed");
+        let empty_simulation = block_on(orchestrator.evaluate_gpu(&settings))
+            .expect("GPU evaluation without simulated cells failed");
         assert!(empty_simulation.chamfer.is_infinite());
         assert_eq!(empty_simulation.sim_to_roi, 0.0);
     }

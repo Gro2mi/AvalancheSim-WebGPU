@@ -58,14 +58,36 @@ pub struct ChamferParams {
     pub _padding: [u32; 3],
 }
 
-/// GPU layout mirror of the ChamferDistanceResult struct in chamfer_reduce.wgsl
+/// GPU layout mirror of the unified evaluation result buffer. The sections
+/// are written by the evaluation shaders:
+/// - counts + extremes by evaluate_mass_movement(_points).wgsl
+/// - chamfer sums by chamfer_reduce.wgsl
+/// - beeline distance by compute_beeline_distance.wgsl
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Pod, Zeroable, Default)]
-pub struct ChamferDistanceResult {
+pub struct EvaluationResult {
+    // mass movement counts (atomic in the shaders)
+    pub intersection: u32,
+    pub undershoot: u32,
+    pub overshoot: u32,
+    pub _padding0: u32,
+    /// ordered-bits encoded, u32::MAX-initialized minimum
+    pub min_elevation: u32,
+    pub max_elevation: u32,
+    pub min_cell: u32,
+    pub max_cell: u32,
+    // chamfer distance sums
     pub sum_sim_to_roi: f32,
     pub count_sim: f32,
     pub sum_roi_to_sim: f32,
     pub count_roi: f32,
+    // beeline distance between the highest and lowest avalanche point
+    pub beeline_distance: f32,
+    pub beeline_min_elevation: f32,
+    pub beeline_max_elevation: f32,
+    pub beeline_min_cell: u32,
+    pub beeline_max_cell: u32,
+    pub _padding: [u32; 3],
 }
 
 #[derive(Eq, Hash, PartialEq, Clone)]
@@ -105,7 +127,8 @@ pub enum BufferName {
     ReleaseAreas,
     RegionOfInterest,
 
-    EvaluationCounts,
+    /// unified evaluation metrics buffer written by the evaluation shaders
+    EvaluationResult,
 
     CenterOfMass,
 
@@ -115,7 +138,6 @@ pub enum BufferName {
     ChamferNearestRoiSnapshot,
     ChamferNearestSim,
     ChamferNearestSimSnapshot,
-    ChamferDistance,
 
     TestOutput,
 }
@@ -150,14 +172,13 @@ impl BufferName {
             BufferName::TestOutput => "test_output",
             BufferName::GridForces => "grid_forces",
             BufferName::RegionOfInterest => "region_of_interest",
-            BufferName::EvaluationCounts => "evaluation_counts",
+            BufferName::EvaluationResult => "evaluation_result",
             BufferName::CenterOfMass => "center_of_mass",
             BufferName::ChamferParams => "chamfer_params",
             BufferName::ChamferNearestRoi => "chamfer_nearest_roi",
             BufferName::ChamferNearestRoiSnapshot => "chamfer_nearest_roi_snapshot",
             BufferName::ChamferNearestSim => "chamfer_nearest_sim",
             BufferName::ChamferNearestSimSnapshot => "chamfer_nearest_sim_snapshot",
-            BufferName::ChamferDistance => "chamfer_distance",
         }
     }
 }
@@ -200,14 +221,13 @@ impl std::str::FromStr for BufferName {
             "test_output" => Ok(BufferName::TestOutput),
             "grid_forces" => Ok(BufferName::GridForces),
             "region_of_interest" => Ok(BufferName::RegionOfInterest),
-            "evaluation_counts" => Ok(BufferName::EvaluationCounts),
+            "evaluation_result" => Ok(BufferName::EvaluationResult),
             "center_of_mass" => Ok(BufferName::CenterOfMass),
             "chamfer_params" => Ok(BufferName::ChamferParams),
             "chamfer_nearest_roi" => Ok(BufferName::ChamferNearestRoi),
             "chamfer_nearest_roi_snapshot" => Ok(BufferName::ChamferNearestRoiSnapshot),
             "chamfer_nearest_sim" => Ok(BufferName::ChamferNearestSim),
             "chamfer_nearest_sim_snapshot" => Ok(BufferName::ChamferNearestSimSnapshot),
-            "chamfer_distance" => Ok(BufferName::ChamferDistance),
             _ => Err(format!("Unknown buffer name: {}", name)),
         }
     }
@@ -823,8 +843,8 @@ pub fn create_buffers_and_texture_descriptions(
     );
     gpu_resources.add_buffer(
         device,
-        BufferName::EvaluationCounts,
-        u32::BITS as usize,
+        BufferName::EvaluationResult,
+        ((size_of::<EvaluationResult>() - 1) / 16 + 1) * 16,
         BufferUsages::STORAGE | BufferUsages::COPY_SRC | BufferUsages::COPY_DST,
     );
     gpu_resources.add_buffer(
@@ -916,7 +936,7 @@ mod tests {
             (BufferName::ParticlesPosition, "particles_position"),
             (BufferName::ParticlesVelocity, "particles_velocity"),
             (BufferName::ParticlesMass, "particles_mass"),
-            (BufferName::ParticlesStopped, "particles_stopped"),
+            (BufferName::ParticlesState, "particles_state"),
             (BufferName::ParticlesElevation, "particles_elevation"),
             (BufferName::ParticlesAffineMatrix, "particles_affine_matrix"),
             (BufferName::TimestepData, "timestep_data"),
@@ -942,7 +962,7 @@ mod tests {
                 BufferName::ChamferNearestSimSnapshot,
                 "chamfer_nearest_sim_snapshot",
             ),
-            (BufferName::ChamferDistance, "chamfer_distance"),
+            (BufferName::EvaluationResult, "evaluation_result"),
         ];
 
         for (name, expected) in cases {

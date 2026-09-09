@@ -424,7 +424,7 @@ mod tests {
 
         assert_eq!(settings.max_steps, Some(42));
         assert_eq!(settings.density, Some(456.7));
-        assert_eq!(settings.sim_model, Some(SimModel::Particle));
+        assert_eq!(settings.sim_model, Some(SimModel::TerrainFollowing));
         assert_eq!(settings.friction_model, Some(FrictionModel::Coulomb));
         assert_eq!(settings.enable_curvature, Some(true));
     }

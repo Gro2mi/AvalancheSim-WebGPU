@@ -1,76 +1,83 @@
-// Accumulates the raw sums for the chamfer distance between the simulated
-// cells (grid_peak_flow_thickness > sim_settings.peak_flow_thickness_threshold)
-// and the region-of-interest bitmask:
-// - sum_sim_to_roi / count_sim: every simulated cell adds the distance to its
-//   nearest region-of-interest cell
-// - sum_roi_to_sim / count_roi: every region-of-interest cell adds the distance
-//   to its nearest simulated cell
-// Runs as a single workgroup with a strided loop, so no atomics are needed.
-// Dispatch exactly one workgroup; the CPU combines the sums into the
-// diagonal-normalized chamfer distance.
+// Computes the 3D beeline distance between the highest and the lowest point
+// of the avalanche: among the cells with peak_flow_thickness above
+// sim_settings.peak_flow_thickness_threshold, the one with the maximum and
+// the one with the minimum terrain elevation (from the DEM) are the extreme
+// points, and the distance is measured between their cell centers in world
+// coordinates plus the elevation difference.
+//
+// Runs as a single workgroup with a strided loop over all cells, so the
+// workgroup barriers provide full global synchronization and the elevation
+// stays paired with its cell index during the reduction - no atomics needed.
+// Dispatch exactly one workgroup.
 
-// The first 32 bytes of the unified evaluation result buffer hold the mass
-// movement counts written by the evaluate shaders; the chamfer sums follow.
-struct ChamferDistanceResult {
+// The unified evaluation result buffer starts with the mass movement counts
+// (32 bytes) and the chamfer sums (16 bytes) written by the other evaluation
+// shaders; the beeline section follows.
+struct BeelineDistanceResult {
     _evaluation_counts: array<u32, 8>,
-    sum_sim_to_roi: f32,
-    count_sim: f32,
-    sum_roi_to_sim: f32,
-    count_roi: f32,
+    _chamfer: array<f32, 4>,
+    distance: f32,
+    min_elevation: f32,
+    max_elevation: f32,
+    min_cell: u32,
+    max_cell: u32,
+    _padding_a: u32,
+    _padding_b: u32,
+    _padding_c: u32,
 }
 
-const NO_SEED: u32 = 0xFFFFFFFFu;
+const NO_CELL: u32 = 0xFFFFFFFFu;
 const WG_SIZE: u32 = 256u;
 
 @group(0) @binding(1) var<storage, read> grid_peak_flow_thickness: array<f32>;
-@group(0) @binding(2) var<storage, read> region_of_interest: array<u32>;
-@group(0) @binding(3) var<storage, read> chamfer_nearest_roi: array<vec2u>;
-@group(0) @binding(4) var<storage, read> chamfer_nearest_sim: array<vec2u>;
-@group(0) @binding(5) var<storage, read_write> chamfer_result: ChamferDistanceResult;
+@group(0) @binding(2) var dem_texture: texture_2d<f32>;
+@group(0) @binding(3) var<storage, read_write> beeline_result: BeelineDistanceResult;
 
-fn bit_is_set(word: u32, index: u32) -> bool {
-    return (word & (1u << (index % 32u))) != 0u;
-}
-
-fn cell_distance(cell: vec2u, seed: vec2u) -> f32 {
-    return length(vec2f(seed) - vec2f(cell)) * sim_settings.cell_size;
-}
-
-var<workgroup> wg_partial: array<vec4f, WG_SIZE>;
+var<workgroup> wg_max_elevation: array<f32, WG_SIZE>;
+var<workgroup> wg_max_cell: array<u32, WG_SIZE>;
+var<workgroup> wg_min_elevation: array<f32, WG_SIZE>;
+var<workgroup> wg_min_cell: array<u32, WG_SIZE>;
 
 @compute @workgroup_size(WG_SIZE, 1, 1)
-fn chamfer_reduce(@builtin(local_invocation_index) li: u32) {
+fn compute_beeline_distance(@builtin(local_invocation_index) li: u32) {
     let num_cells = sim_settings.grid_shape.x * sim_settings.grid_shape.y;
 
-    // x: sum_sim_to_roi, y: count_sim, z: sum_roi_to_sim, w: count_roi
-    var partial = vec4f(0.0, 0.0, 0.0, 0.0);
+    // per-thread extremes, elevation and cell index stay paired
+    var max_elevation = -1e30;
+    var max_cell = NO_CELL;
+    var min_elevation = 1e30;
+    var min_cell = NO_CELL;
     for (var i = li; i < num_cells; i = i + WG_SIZE) {
-        let simulated = grid_peak_flow_thickness[i] > sim_settings.peak_flow_thickness_threshold;
-        let reference = bit_is_set(region_of_interest[i / 32u], i);
-
-        if simulated {
-            let seed = chamfer_nearest_roi[i];
-            if seed.x != NO_SEED {
-                partial.x = partial.x + cell_distance(idx_to_xy(i), seed);
+        if grid_peak_flow_thickness[i] > sim_settings.peak_flow_thickness_threshold {
+            let elevation = textureLoad(dem_texture, vec2<i32>(idx_to_xy(i)), 0).r;
+            if elevation > max_elevation {
+                max_elevation = elevation;
+                max_cell = i;
             }
-            partial.y = partial.y + 1.0;
-        }
-        if reference {
-            let seed = chamfer_nearest_sim[i];
-            if seed.x != NO_SEED {
-                partial.z = partial.z + cell_distance(idx_to_xy(i), seed);
+            if elevation < min_elevation {
+                min_elevation = elevation;
+                min_cell = i;
             }
-            partial.w = partial.w + 1.0;
         }
     }
-    wg_partial[li] = partial;
+    wg_max_elevation[li] = max_elevation;
+    wg_max_cell[li] = max_cell;
+    wg_min_elevation[li] = min_elevation;
+    wg_min_cell[li] = min_cell;
     workgroupBarrier();
 
-    // tree reduction of the per-thread partial sums
+    // tree reduction of both extremes with their paired cell indices
     var stride_size = WG_SIZE / 2u;
     loop {
         if li < stride_size {
-            wg_partial[li] = wg_partial[li] + wg_partial[li + stride_size];
+            if wg_max_elevation[li + stride_size] > wg_max_elevation[li] {
+                wg_max_elevation[li] = wg_max_elevation[li + stride_size];
+                wg_max_cell[li] = wg_max_cell[li + stride_size];
+            }
+            if wg_min_elevation[li + stride_size] < wg_min_elevation[li] {
+                wg_min_elevation[li] = wg_min_elevation[li + stride_size];
+                wg_min_cell[li] = wg_min_cell[li + stride_size];
+            }
         }
         workgroupBarrier();
         if stride_size == 1u {
@@ -80,12 +87,17 @@ fn chamfer_reduce(@builtin(local_invocation_index) li: u32) {
     }
 
     if li == 0u {
-        chamfer_result.sum_sim_to_roi = wg_partial[0].x;
-        chamfer_result.count_sim = wg_partial[0].y;
-        chamfer_result.sum_roi_to_sim = wg_partial[0].z;
-        chamfer_result.count_roi = wg_partial[0].w;
+        beeline_result.max_elevation = wg_max_elevation[0u];
+        beeline_result.min_elevation = wg_min_elevation[0u];
+        beeline_result.max_cell = wg_max_cell[0u];
+        beeline_result.min_cell = wg_min_cell[0u];
+        let has_avalanche_cells = wg_max_cell[0u] != NO_CELL && wg_min_cell[0u] != NO_CELL;
+        let d = cell_center_xy(idx_to_xy(wg_max_cell[0u])) - cell_center_xy(idx_to_xy(wg_min_cell[0u]));
+        let dz = wg_max_elevation[0u] - wg_min_elevation[0u];
+        beeline_result.distance = select(0.0, length(vec3f(d.x, d.y, dz)), has_avalanche_cells);
     }
 }
+
 // import utils.wgsl;
 // BEGIN utils.wgsl
 const WG_SIZE_2D: u32 = 16u;

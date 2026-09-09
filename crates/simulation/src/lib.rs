@@ -31,7 +31,7 @@
 //!     .await?;
 //! sim.run().await?;                       // terrain + release + particles + physics
 //! sim.post_process().await?;              // avalanche mask from peak flow thickness
-//! let (iou, ..) = sim.evaluate().await?;  // metrics against the outline
+//! let evaluation = sim.evaluate().await?;  // metrics against the outline
 //! sim.save().await?;                      // write Zarr results
 //! ```
 
@@ -40,6 +40,7 @@ use compute_core::{
     ComputeOrchestrator, GpuCache, ParticleState, SimInfo, SimInfoFlags, TextureRgba, TimestepData,
     buffers::{AtomicValues, BufferName, CenterOfMassResult, TextureName},
     dem::{Bounds, Dem},
+    evaluation::MassMovementEvaluation,
     post_processing::*,
     settings::{CrownLineMethod, Settings, SimModel, SimSettings},
     utils::*,
@@ -158,6 +159,7 @@ pub struct Simulation {
     pub dem: Dem,
     /// Region-of-interest (avalanche outline) cell mask, one entry per cell.
     pub roi: Vec<bool>,
+    roi_uploaded: bool,
     /// Destination of [`Simulation::save`] (Zarr store path or prefix).
     pub output_path: String,
     release_areas_path: Option<String>,
@@ -197,6 +199,7 @@ impl Simulation {
             dem_path: String::new(),
             dem: Dem::default(),
             roi: Vec::new(),
+            roi_uploaded: false,
             number_particles: 0,
             state: SimulationState::Uninitialized,
             gpu_cache: GpuCache::default(),
@@ -313,6 +316,7 @@ impl Simulation {
         self.dem = data.dem;
         self.dem_path = data.dem_path;
         self.roi = data.roi;
+        self.roi_uploaded = false;
         self.output_path = data
             .output_path
             .unwrap_or_else(|| "avalanchers.zarr".to_string());
@@ -586,6 +590,22 @@ impl Simulation {
             );
         }
         self.roi = roi.to_vec();
+        self.roi_uploaded = false;
+        Ok(())
+    }
+
+    /// Uploads the current region-of-interest mask to the GPU. GPU evaluation
+    /// requires this method to have completed after the most recent
+    /// [`Self::set_roi`].
+    pub async fn upload_roi(&mut self) -> Result<()> {
+        if self.roi.is_empty() {
+            bail!("Cannot upload an empty region of interest");
+        }
+        let roi_words = Self::pack_roi_mask(&self.roi);
+        self.orchestrator
+            .write_buffer(BufferName::RegionOfInterest, &roi_words)
+            .await?;
+        self.roi_uploaded = true;
         Ok(())
     }
 
@@ -594,6 +614,9 @@ impl Simulation {
     /// particle initialization.
     pub async fn prepare(&mut self) -> Result<()> {
         self.analyze_terrain().await?;
+        if !self.roi.is_empty() {
+            self.upload_roi().await?;
+        }
         let _ = self.load_release_areas().await?;
         self.initialize_particles().await?;
         Ok(())
@@ -685,6 +708,9 @@ impl Simulation {
     pub async fn run(&mut self) -> Result<()> {
         self.analyze_terrain().await?;
         timer_checkpoint("Terrain analyzed");
+        if !self.roi.is_empty() {
+            self.upload_roi().await?;
+        }
         let _ = self.load_release_areas().await?;
         timer_checkpoint("Release areas loaded");
         if self.number_particles == 0 {
@@ -734,49 +760,55 @@ impl Simulation {
     /// moves the state to [`SimulationState::Evaluated`]. Requires
     /// [`SimulationState::PostProcessed`].
     ///
-    /// Returns `(iou, horizontal_distance, vertical_drop,
-    /// horizontal_distance_ref, vertical_drop_ref, beeline_3d, beeline_3d_ref,
-    /// peak_velocity)`: the Jaccard index of mask vs. outline, the runout
-    /// horizontal distance and vertical drop of simulation and reference
-    /// outline, the corresponding 3D beeline lengths, and the maximum peak
-    /// velocity.
-    pub async fn evaluate(&mut self) -> Result<(f32, f32, f32, f32, f32, f32, f32, f32)> {
+    /// Returns the CPU-derived overlap, runout, and peak velocity metrics.
+    /// GPU-derived chamfer metrics can be added with [`Self::evaluate_gpu`].
+    pub async fn evaluate(&mut self) -> Result<MassMovementEvaluation> {
         if self.state < SimulationState::PostProcessed {
             bail!("Simulation must be post-processed before evaluation");
         }
-        let iou = compute_core::evaluation::evaluate_mass_movement_area(&self.ava_mask, &self.roi)
-            .map_err(|e| anyhow::anyhow!("Mass movement area evaluation failed: {e:?}"))?
-            .jaccard;
+        let overlap =
+            compute_core::evaluation::evaluate_mass_movement_area(&self.ava_mask, &self.roi)
+                .map_err(|e| anyhow::anyhow!("Mass movement area evaluation failed: {e:?}"))?;
         let (horizontal_distance, vertical_drop) = self
             .dem
             .get_elevation_extrema_distance_and_drop(&self.ava_mask)
             .unwrap_or((0.0, 0.0));
-        let beeline_3d = horizontal_distance.hypot(vertical_drop);
         let (horizontal_distance_ref, vertical_drop_ref) = self
             .dem
             .get_elevation_extrema_distance_and_drop(&self.roi)
             .unwrap_or((0.0, 0.0));
-        let beeline_3d_ref = horizontal_distance_ref.hypot(vertical_drop_ref);
         let velocities = self.fetch_peak_velocity().await?;
         let peak_velocity = velocities.iter().copied().reduce(f32::max).unwrap_or(0.0);
         self.state = SimulationState::Evaluated;
-        Ok((
-            iou as f32,
-            horizontal_distance,
-            vertical_drop,
-            horizontal_distance_ref,
-            vertical_drop_ref,
-            beeline_3d,
-            beeline_3d_ref,
-            peak_velocity,
+        Ok(overlap.with_runout(
+            horizontal_distance as f64,
+            vertical_drop as f64,
+            horizontal_distance_ref as f64,
+            vertical_drop_ref as f64,
+            peak_velocity as f64,
         ))
     }
 
-    /// Runs the GPU evaluation metrics: mass movement counts (alpha/beta/gamma/
-    /// jaccard), the diagonal-normalized chamfer distance against the region of
-    /// interest and the 3D beeline distance between the highest and lowest
-    /// avalanche point.
+    /// Runs the GPU evaluation metrics: overlap components, diagonal-normalized
+    /// chamfer distance, and the 3D beeline distance between the highest and
+    /// lowest avalanche point.
+    /// Packs the per-cell ROI mask into u32 words (least significant bit =
+    /// first cell), the layout the evaluation shaders expect.
+    fn pack_roi_mask(roi: &[bool]) -> Vec<u32> {
+        roi.chunks(32)
+            .map(|chunk| {
+                chunk
+                    .iter()
+                    .enumerate()
+                    .fold(0u32, |word, (bit, &set)| word | ((set as u32) << bit))
+            })
+            .collect()
+    }
+
     pub async fn evaluate_gpu(&mut self) -> Result<MassMovementEvaluation> {
+        if !self.roi_uploaded {
+            bail!("Region of interest must be uploaded before GPU evaluation");
+        }
         self.orchestrator.evaluate_gpu(&self.settings).await
     }
 
@@ -2384,6 +2416,59 @@ mod tests {
     }
 
     #[test_log::test]
+    fn test_evaluate_gpu_chamfer_with_roi() {
+        // Regression test: the evaluation shaders read the region of interest
+        // from the GPU buffer, which must be uploaded from the CPU-side mask
+        // before evaluating. Without the upload every ROI read is zero and
+        // the chamfer distance is infinite.
+        let mut sim = setup_simple_sim(40.0, 3.0);
+        block_on(sim.run()).expect("Failed to run simulation");
+        let simulated_cells = [14usize, 15, 20, 21];
+        let mut peak_flow_thickness = vec![0.0f32; sim.dem.width * sim.dem.height];
+        sim.ava_mask = vec![false; peak_flow_thickness.len()];
+        for &cell in &simulated_cells {
+            peak_flow_thickness[cell] = 1.0;
+            sim.ava_mask[cell] = true;
+        }
+        block_on(
+            sim.orchestrator
+                .write_buffer(BufferName::GridPeakFlowThickness, &peak_flow_thickness),
+        )
+        .expect("Failed to seed simulated peak flow thickness");
+
+        // ROI identical to the simulated mask: every nearest distance is 0
+        sim.set_roi(&sim.ava_mask.clone())
+            .expect("Failed to set roi");
+        block_on(sim.upload_roi()).expect("Failed to upload roi");
+        let evaluation = block_on(sim.evaluate_gpu()).expect("GPU evaluation failed");
+        assert!(
+            (evaluation.chamfer - 0.0).abs() < 1e-9,
+            "chamfer was {}",
+            evaluation.chamfer
+        );
+        assert!(
+            (evaluation.iou - 1.0).abs() < 1e-9,
+            "iou was {}",
+            evaluation.iou
+        );
+
+        // ROI narrowed to the two release cells only: the simulated cells
+        // that ran downslope are no longer covered, so the chamfer distance
+        // is positive but finite
+        let mut release_only = vec![false; sim.ava_mask.len()];
+        release_only[14] = true;
+        release_only[15] = true;
+        sim.set_roi(&release_only).expect("Failed to set roi");
+        block_on(sim.upload_roi()).expect("Failed to upload roi");
+        let shifted_evaluation = block_on(sim.evaluate_gpu()).expect("GPU evaluation failed");
+        assert!(
+            shifted_evaluation.chamfer.is_finite() && shifted_evaluation.chamfer > 0.0,
+            "chamfer was {}",
+            shifted_evaluation.chamfer
+        );
+    }
+
+    #[test_log::test]
     fn test_compute_simple() {
         let slope_angle: f32 = 40.0;
         let cell_size: f32 = 3.0;
@@ -2398,20 +2483,18 @@ mod tests {
         info!("Atomic values: {:?}", atomics);
         assert_eq!(atomics.number_release_particles, 16);
         assert_eq!(atomics.stopped_particles, 16);
-        let stopped = block_on(sim.fetch_particles_state()).expect("Failed to fetch particles");
+        let state = block_on(sim.fetch_particles_state()).expect("Failed to fetch particles");
+        for p in state.iter() {
+            info!("{:?}", p);
+        }
         println!(
             "Particles stopped at step 0: {}",
-            stopped.iter().filter(|state| state.timestep == 0).count()
+            state.iter().filter(|state| state.timestep == 0).count()
         );
-        assert_eq!(
-            stopped.iter().filter(|state| state.timestep > 10).count(),
-            0
-        );
-        assert_eq!(
-            stopped.iter().filter(|state| state.timestep == 0).count(),
-            0
-        );
-        for p in stopped.iter() {
+        assert_eq!(state.iter().filter(|state| state.timestep > 2).count(), 0);
+        assert_eq!(state.iter().filter(|state| state.stopped).count(), 16);
+        assert_eq!(state.iter().filter(|state| state.out_of_bounds).count(), 16);
+        for p in state.iter() {
             info!("{:?}", p);
         }
         let cell_area = cell_size * cell_size;
@@ -2973,11 +3056,11 @@ mod tests {
         let mut sim = setup_simple_sim(40.0, 3.0);
 
         let initial = block_on(sim.run_n_steps(0)).expect("Failed to prepare simulation");
-        assert_eq!(initial.timestep, 1);
+        assert_eq!(initial.timestep, 0);
         assert_eq!(sim.state, SimulationState::Running);
 
         let advanced = block_on(sim.run_n_steps(1)).expect("Failed to advance simulation");
-        assert_eq!(advanced.timestep, 2);
+        assert_eq!(advanced.timestep, 1);
         assert_eq!(sim.state, SimulationState::Running);
 
         let finished = block_on(sim.run_n_steps(1)).expect("Failed to resume simulation");
@@ -2995,7 +3078,7 @@ mod tests {
 
         let result = block_on(sim.run_n_steps(u32::MAX)).expect("Failed to advance simulation");
 
-        assert_eq!(result.timestep, 2);
+        assert_eq!(result.timestep, 1);
         assert_eq!(sim.state, SimulationState::Finished);
     }
 

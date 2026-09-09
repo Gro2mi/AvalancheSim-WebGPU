@@ -1,16 +1,68 @@
 /// Structure to hold the evaluated normalized components of the metric.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct MassMovementEvaluation {
-    /// Overlap normalized component (alpha_T)
-    pub alpha: f64,
-    /// Underestimation normalized component (beta_T)
-    pub beta: f64,
-    /// Overestimation normalized component (gamma_T)
-    pub gamma: f64,
-    /// The final composite index (Omega_T) which ranges between -1 and 1
-    pub jaccard: f64,
-    /// Straight-line 3D distance between the highest and lowest simulated cells.
-    pub beeline_distance_3d: f64,
+    pub intersection: f64,
+    pub undershoot: f64,
+    pub overshoot: f64,
+    pub iou: f64,
+    pub horizontal_distance: f64,
+    pub vertical_drop: f64,
+    pub horizontal_distance_ref: f64,
+    pub vertical_drop_ref: f64,
+    pub beeline_3d: f64,
+    pub beeline_3d_ref: f64,
+    pub peak_velocity: f64,
+    pub sim_to_roi: f64,
+    pub roi_to_sim: f64,
+    pub chamfer: f64,
+}
+
+impl Default for MassMovementEvaluation {
+    fn default() -> Self {
+        Self {
+            intersection: 0.0,
+            undershoot: 0.0,
+            overshoot: 0.0,
+            iou: 0.0,
+            horizontal_distance: 0.0,
+            vertical_drop: 0.0,
+            horizontal_distance_ref: 0.0,
+            vertical_drop_ref: 0.0,
+            beeline_3d: 0.0,
+            beeline_3d_ref: 0.0,
+            peak_velocity: 0.0,
+            sim_to_roi: 0.0,
+            roi_to_sim: 0.0,
+            chamfer: 0.0,
+        }
+    }
+}
+
+impl MassMovementEvaluation {
+    pub fn with_runout(
+        mut self,
+        horizontal_distance: f64,
+        vertical_drop: f64,
+        horizontal_distance_ref: f64,
+        vertical_drop_ref: f64,
+        peak_velocity: f64,
+    ) -> Self {
+        self.horizontal_distance = horizontal_distance;
+        self.vertical_drop = vertical_drop;
+        self.horizontal_distance_ref = horizontal_distance_ref;
+        self.vertical_drop_ref = vertical_drop_ref;
+        self.beeline_3d = horizontal_distance.hypot(vertical_drop);
+        self.beeline_3d_ref = horizontal_distance_ref.hypot(vertical_drop_ref);
+        self.peak_velocity = peak_velocity;
+        self
+    }
+
+    pub fn with_chamfer(mut self, chamfer: ChamferDistance) -> Self {
+        self.sim_to_roi = chamfer.sim_to_roi;
+        self.roi_to_sim = chamfer.roi_to_sim;
+        self.chamfer = chamfer.chamfer;
+        self
+    }
 }
 
 /// Errors that could happen during the evaluation phase.
@@ -62,7 +114,7 @@ pub fn evaluate_mass_movement_area(
 
 /// Diagonal-normalized chamfer distance between the simulated cells and the
 /// reference (region of interest) cells.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct ChamferDistance {
     /// Mean nearest-neighbor distance from simulated cells to the nearest
     /// region-of-interest cell, normalized by the grid diagonal.
@@ -120,30 +172,28 @@ pub(crate) fn evaluation_from_counts(
     // Handle edge case where neither simulation nor observation has any affected pixels
     if total_union == 0 {
         return MassMovementEvaluation {
-            alpha: 1.0,
-            beta: 0.0,
-            gamma: 0.0,
-            jaccard: 1.0, // Perfect fit if nothing was supposed to happen and nothing did
-            beeline_distance_3d: 0.0,
+            intersection: 1.0,
+            iou: 1.0,
+            ..Default::default()
         };
     }
 
     let t_f64 = total_union as f64;
 
     // Calculate components normalized by total area T
-    let alpha_t = (count_intersection as f64) / t_f64;
-    let beta_t = (count_undershoot as f64) / t_f64;
-    let gamma_t = (count_overshoot as f64) / t_f64;
+    let intersection = (count_intersection as f64) / t_f64;
+    let undershoot = (count_undershoot as f64) / t_f64;
+    let overshoot = (count_overshoot as f64) / t_f64;
 
     // Omega_T = alpha_T - beta_T - gamma_T
-    let omega_t = alpha_t - beta_t - gamma_t;
+    let omega_t = intersection - undershoot - overshoot;
 
     MassMovementEvaluation {
-        alpha: alpha_t,
-        beta: beta_t,
-        gamma: gamma_t,
-        jaccard: (omega_t + 1.0) / 2.0,
-        beeline_distance_3d: 0.0,
+        intersection,
+        undershoot,
+        overshoot,
+        iou: (omega_t + 1.0) / 2.0,
+        ..Default::default()
     }
 }
 
@@ -221,27 +271,25 @@ pub fn evaluate_distance_weighted_mass_movement_runout(
     // Edge case where no cells are active anywhere
     if w_t == 0.0 {
         return Ok(MassMovementEvaluation {
-            alpha: 1.0,
-            beta: 0.0,
-            gamma: 0.0,
-            jaccard: 1.0,
-            beeline_distance_3d: 0.0,
+            intersection: 1.0,
+            iou: 1.0,
+            ..Default::default()
         });
     }
 
-    let alpha = w_x / w_t;
-    let beta = w_u / w_t;
-    let gamma = w_o / w_t;
+    let intersection = w_x / w_t;
+    let undershoot = w_u / w_t;
+    let overshoot = w_o / w_t;
 
     // Asymmetric penalty: overshoots (gamma) are less penalized via lambda scaling
-    let omega = alpha - beta - (lambda * gamma);
+    let omega = intersection - undershoot - (lambda * overshoot);
 
     Ok(MassMovementEvaluation {
-        alpha,
-        beta,
-        gamma,
-        jaccard: (omega + 1.0) / 2.0,
-        beeline_distance_3d: 0.0,
+        intersection,
+        undershoot,
+        overshoot,
+        iou: (omega + 1.0) / 2.0,
+        ..Default::default()
     })
 }
 
@@ -257,10 +305,10 @@ mod tests {
         let simulated = vec![true, false, true, false, true, false];
 
         let result = evaluate_mass_movement_area(&reference, &simulated).unwrap();
-        assert_eq!(result.alpha, 1.0);
-        assert_eq!(result.beta, 0.0);
-        assert_eq!(result.gamma, 0.0);
-        assert_eq!(result.jaccard, 1.0);
+        assert_eq!(result.intersection, 1.0);
+        assert_eq!(result.undershoot, 0.0);
+        assert_eq!(result.overshoot, 0.0);
+        assert_eq!(result.iou, 1.0);
     }
 
     #[test]
@@ -271,12 +319,12 @@ mod tests {
         let simulated = vec![false, false, false, false, true, true];
 
         let result = evaluate_mass_movement_area(&reference, &simulated).unwrap();
-        assert_eq!(result.alpha, 0.0);
-        assert_eq!(result.jaccard, 0.0);
+        assert_eq!(result.intersection, 0.0);
+        assert_eq!(result.iou, 0.0);
 
         // Total area T is the union of 2 reference cells + 2 simulated cells = 4 cells
-        assert_eq!(result.beta, 0.5); // 2/4
-        assert_eq!(result.gamma, 0.5); // 2/4
+        assert_eq!(result.undershoot, 0.5); // 2/4
+        assert_eq!(result.overshoot, 0.5); // 2/4
     }
 
     #[test]
@@ -293,10 +341,10 @@ mod tests {
         let simulated = vec![false, true, true, false, true, false];
 
         let result = evaluate_mass_movement_area(&reference, &simulated).unwrap();
-        assert_eq!(result.alpha, 0.5);
-        assert_eq!(result.beta, 0.25);
-        assert_eq!(result.gamma, 0.25);
-        assert_eq!(result.jaccard, 0.5);
+        assert_eq!(result.intersection, 0.5);
+        assert_eq!(result.undershoot, 0.25);
+        assert_eq!(result.overshoot, 0.25);
+        assert_eq!(result.iou, 0.5);
     }
 
     #[test]
@@ -307,8 +355,8 @@ mod tests {
         let simulated = vec![false, false, false, false];
 
         let result = evaluate_mass_movement_area(&reference, &simulated).unwrap();
-        assert_eq!(result.alpha, 1.0);
-        assert_eq!(result.jaccard, 1.0);
+        assert_eq!(result.intersection, 1.0);
+        assert_eq!(result.iou, 1.0);
     }
 
     #[test]
@@ -387,7 +435,7 @@ mod tests {
         let grid = vec![vec![false, false], vec![false, true]];
         let result =
             evaluate_distance_weighted_mass_movement_runout(&grid, &grid, (0, 0), 0.5).unwrap();
-        assert_near(result.jaccard, 1.0);
+        assert_near(result.iou, 1.0);
     }
 
     #[test]
@@ -414,10 +462,10 @@ mod tests {
         // The spatial configurations are mirror mismatches, but because overshoot is safer,
         // the overshoot scenario MUST yield a higher hazard evaluation score than the undershoot.
         assert!(
-            eval_overshoot.jaccard > eval_undershoot.jaccard,
+            eval_overshoot.iou > eval_undershoot.iou,
             "Overshoot score ({}) should be preferred over Undershoot score ({})",
-            eval_overshoot.jaccard,
-            eval_undershoot.jaccard
+            eval_overshoot.iou,
+            eval_undershoot.iou
         );
     }
 
@@ -447,10 +495,10 @@ mod tests {
         // The runout-failing simulation (eval_far) must get penalized more heavily (lower score)
         // because the error happened further down the path from the apex point.
         assert!(
-            eval_close.jaccard > eval_far.jaccard,
+            eval_close.iou > eval_far.iou,
             "Distal runout errors must yield a worse metric score than proximal errors. Close: {}, Far: {}",
-            eval_close.jaccard,
-            eval_far.jaccard
+            eval_close.iou,
+            eval_far.iou
         );
     }
 
@@ -513,44 +561,44 @@ mod tests {
 
                         // Absolute upper bound invariant assertions (<= 1.0)
                         assert!(
-                            result.alpha <= 1.0,
+                            result.intersection <= 1.0,
                             "alpha ({}) exceeded 1.0 at ref: {}, sim: {}",
-                            result.alpha,
+                            result.intersection,
                             ref_bits,
                             sim_bits
                         );
                         assert!(
-                            result.beta <= 1.0,
+                            result.undershoot <= 1.0,
                             "beta ({}) exceeded 1.0 at ref: {}, sim: {}",
-                            result.beta,
+                            result.undershoot,
                             ref_bits,
                             sim_bits
                         );
                         assert!(
-                            result.gamma <= 1.0,
+                            result.overshoot <= 1.0,
                             "gamma ({}) exceeded 1.0 at ref: {}, sim: {}",
-                            result.gamma,
+                            result.overshoot,
                             ref_bits,
                             sim_bits
                         );
                         assert!(
-                            result.jaccard <= 1.0,
+                            result.iou <= 1.0,
                             "omega ({}) exceeded 1.0 at ref: {}, sim: {}",
-                            result.jaccard,
+                            result.iou,
                             ref_bits,
                             sim_bits
                         );
 
                         // Optional safety check: ensure the normalized subsets are never negative
-                        assert!(result.alpha >= 0.0);
-                        assert!(result.beta >= 0.0);
-                        assert!(result.gamma >= 0.0);
+                        assert!(result.intersection >= 0.0);
+                        assert!(result.undershoot >= 0.0);
+                        assert!(result.overshoot >= 0.0);
 
                         // Omega can go down to -1.0, but never past +1.0
                         assert!(
-                            result.jaccard >= -1.00001,
+                            result.iou >= -1.00001,
                             "omega ({}) below -1.0 at ref: {}, sim: {}",
-                            result.jaccard,
+                            result.iou,
                             ref_bits,
                             sim_bits
                         );
