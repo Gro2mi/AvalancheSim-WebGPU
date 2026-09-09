@@ -78,8 +78,8 @@ impl std::fmt::Debug for SimInfoFlags {
     }
 }
 
-const PARTICLE_FLYING: u32 = 27u32 << 0;
-const PARTICLE_OUT_OF_BOUNDS: u32 = 28u32 << 0;
+const PARTICLE_FLYING: u32 = 1u32 << 27;
+const PARTICLE_OUT_OF_BOUNDS: u32 = 1u32 << 28;
 const PARTICLE_IS_NAN: u32 = 1u32 << 29;
 const PARTICLE_OUT_OF_DEM_DATA: u32 = 1u32 << 30;
 const PARTICLE_STOPPED: u32 = 1u32 << 31;
@@ -451,15 +451,6 @@ struct SimulationBindGroups {
     particle_update: BindGroup,
     update_sim_info: BindGroup,
     center_of_mass: BindGroup,
-}
-
-fn ordered_u32_to_f32(ordered: u32) -> f32 {
-    let bits = if ordered & 0x8000_0000 != 0 {
-        ordered ^ 0x8000_0000
-    } else {
-        !ordered
-    };
-    f32::from_bits(bits)
 }
 
 pub struct ComputeOrchestrator {

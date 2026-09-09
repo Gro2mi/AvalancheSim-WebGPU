@@ -463,6 +463,53 @@ impl<'de> Deserialize<'de> for SimModel {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CrownLineMethod {
+    FlowRouting,
+    ParticleSimulation,
+}
+
+impl FromStr for CrownLineMethod {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.to_lowercase().replace('_', "-").as_str() {
+            "flow-routing" | "flow" | "d8" => Ok(Self::FlowRouting),
+            "particle-simulation" | "particle" => Ok(Self::ParticleSimulation),
+            _ => Err(format!("unknown crown line method: {value}")),
+        }
+    }
+}
+
+impl fmt::Display for CrownLineMethod {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.write_str(match self {
+            Self::FlowRouting => "flow-routing",
+            Self::ParticleSimulation => "particle-simulation",
+        })
+    }
+}
+
+impl Serialize for CrownLineMethod {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&self.to_string())
+    }
+}
+
+impl<'de> Deserialize<'de> for CrownLineMethod {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        String::deserialize(deserializer)?
+            .parse::<Self>()
+            .map_err(D::Error::custom)
+    }
+}
+
 #[derive(Serialize, Deserialize, Debug, Default, Clone)]
 #[serde(deny_unknown_fields)]
 pub struct Settings {
@@ -493,6 +540,15 @@ pub struct Settings {
     pub max_slope_angle: Option<f32>,
     pub release_min_elevation: Option<f32>,
     pub release_max_elevation: Option<f32>,
+    /// Target release area as a fraction of the outline area (0.2 - 0.3 is a
+    /// common range). When set, release areas are estimated by detecting the
+    /// outline's crown line and filling this share below it, instead of the
+    /// terrain-threshold classification.
+    pub release_area_fraction: Option<f32>,
+    /// How the crown line is detected for `release_area_fraction`: D8 flow
+    /// routing on the CPU (default) or a GPU particle simulation released
+    /// everywhere outside the outline.
+    pub crown_line_method: Option<CrownLineMethod>,
     pub velocity_threshold: Option<f32>,
     pub roughness_threshold: Option<f32>,
     pub peak_flow_thickness_threshold: Option<f32>,
@@ -626,6 +682,8 @@ mod tests {
             max_slope_angle: Some(20.0),
             release_min_elevation: Some(100.0),
             release_max_elevation: Some(200.0),
+            release_area_fraction: Some(0.25),
+            crown_line_method: Some(CrownLineMethod::ParticleSimulation),
             velocity_threshold: Some(0.001),
             roughness_threshold: Some(0.002),
             peak_flow_thickness_threshold: Some(1.5),
@@ -898,6 +956,41 @@ mod tests {
     fn friction_model_invalid_string() {
         assert!(FrictionModel::from_str("invalid").is_err());
         assert!(FrictionModel::from_str("").is_err());
+    }
+
+    #[test]
+    fn crown_line_method_string_roundtrip() {
+        let methods = [
+            (CrownLineMethod::FlowRouting, "flow-routing"),
+            (CrownLineMethod::ParticleSimulation, "particle-simulation"),
+        ];
+
+        for (method, string) in methods {
+            assert_eq!(method.to_string(), string);
+            assert_eq!(CrownLineMethod::from_str(string), Ok(method));
+        }
+    }
+
+    #[test]
+    fn crown_line_method_string_aliases() {
+        assert_eq!(
+            CrownLineMethod::from_str("flow_routing"),
+            Ok(CrownLineMethod::FlowRouting)
+        );
+        assert_eq!(
+            CrownLineMethod::from_str("D8"),
+            Ok(CrownLineMethod::FlowRouting)
+        );
+        assert_eq!(
+            CrownLineMethod::from_str("particle"),
+            Ok(CrownLineMethod::ParticleSimulation)
+        );
+    }
+
+    #[test]
+    fn crown_line_method_invalid_string() {
+        assert!(CrownLineMethod::from_str("invalid").is_err());
+        assert!(CrownLineMethod::from_str("").is_err());
     }
 
     #[test]

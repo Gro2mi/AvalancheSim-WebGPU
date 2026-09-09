@@ -178,7 +178,7 @@ def plot2d(sim, parameter, title="Avalanche Simulation", threshold_value=1e-3, p
         mask = speed > 0
         ax.scatter(positions[mask, 0], positions[mask, 1], c=speed[mask], s=2, alpha=0.7, cmap='Blues')
     if roi:
-        ax.contour(x, y, sim.roi, levels=[0.01], colors='red')
+        ax.contour(x, y, sim.roi, levels=[0.99], colors='red')
         ax.legend(
             handles=[
                 plt.Line2D([0], [0], color="cyan", lw=2, label="Release Areas"),

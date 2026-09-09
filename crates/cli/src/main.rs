@@ -1,7 +1,7 @@
 // compute_cli/src/main.rs
 use anyhow::Result;
 use clap::Parser;
-use compute_core::settings::{FrictionModel, Settings, SimModel};
+use compute_core::settings::{CrownLineMethod, FrictionModel, Settings, SimModel};
 #[allow(unused_imports)]
 use compute_core::utils::{MaxValue, timer_checkpoint, timer_get_summary, timer_new};
 use pollster::block_on;
@@ -27,6 +27,11 @@ fn parse_sim_model(value: &str) -> Result<SimModel> {
 fn parse_friction_model(value: &str) -> Result<FrictionModel> {
     FrictionModel::from_str(value)
         .map_err(|err| anyhow::anyhow!("invalid friction model '{value}': {err}"))
+}
+
+fn parse_crown_line_method(value: &str) -> Result<CrownLineMethod> {
+    CrownLineMethod::from_str(value)
+        .map_err(|err| anyhow::anyhow!("invalid crown line method '{value}': {err}"))
 }
 
 #[derive(Parser, Debug)]
@@ -99,6 +104,10 @@ struct Args {
     #[arg(long)]
     release_min_elevation: Option<f32>,
     #[arg(long)]
+    release_area_fraction: Option<f32>,
+    #[arg(long, value_parser = parse_crown_line_method)]
+    crown_line_method: Option<CrownLineMethod>,
+    #[arg(long)]
     velocity_threshold: Option<f32>,
     #[arg(long)]
     roughness_threshold: Option<f32>,
@@ -127,6 +136,15 @@ impl Args {
         }
         if let Some(value) = self.release_areas_path.clone() {
             settings.release_areas_path = Some(value);
+        }
+        if let Some(value) = self.release_area_fraction {
+            settings.release_area_fraction = Some(value);
+        }
+        if let Some(value) = self.crown_line_method {
+            settings.crown_line_method = Some(value);
+        }
+        if let Some(value) = self.enable_center_of_mass {
+            settings.enable_center_of_mass = Some(value);
         }
         if let Some(value) = self.output_path.clone() {
             settings.output_path = Some(value);
@@ -396,6 +414,9 @@ mod tests {
             enable_particle_interaction: None,
             enable_earth_pressure_coefficient: None,
             enable_entrainment: None,
+            release_area_fraction: None,
+            crown_line_method: None,
+            enable_center_of_mass: None,
         };
 
         args.apply_overrides(&mut settings)

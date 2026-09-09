@@ -1,10 +1,47 @@
+//! High-level, GPU-accelerated snow avalanche simulation.
+//!
+//! This crate drives the wgpu compute shaders in [`compute_core`] through a
+//! single [`Simulation`] type that owns the full pipeline:
+//!
+//! 1. **Load** settings, a DEM and optionally a region of interest from a
+//!    [`Settings`] file (`Simulation::create*`), or set the DEM, release
+//!    areas and outline programmatically
+//!    ([`Simulation::set_dem_with_bounds`], [`Simulation::set_release_areas`],
+//!    [`Simulation::set_roi`]).
+//! 2. **Prepare** the run: terrain analysis, release-area determination and
+//!    particle seeding ([`Simulation::prepare`]).
+//! 3. **Simulate**: step the particle or MPM model
+//!    ([`Simulation::run_n_steps`], [`Simulation::run`]).
+//! 4. **Consume**: read results back through the cached `fetch_*` methods,
+//!    extract the avalanche mask ([`Simulation::post_process`]), evaluate it
+//!    against the outline ([`Simulation::evaluate`],
+//!    [`Simulation::evaluate_gpu`]) and persist everything to a Zarr store
+//!    ([`Simulation::save`] on native, `export_zarr_entries` in the browser).
+//!
+//! Each stage records its completion in a [`SimulationState`]; methods bail
+//! with an error when their prerequisites have not run yet. The same code
+//! compiles for native targets and `wasm32`, but file output only exists on
+//! native.
+//!
+//! A minimal native example:
+//!
+//! ```ignore
+//! let mut sim = Simulation::new().await?;
+//! sim.create_default_with_release_areas("data/dem.png", "data/release.png")
+//!     .await?;
+//! sim.run().await?;                       // terrain + release + particles + physics
+//! sim.post_process().await?;              // avalanche mask from peak flow thickness
+//! let (iou, ..) = sim.evaluate().await?;  // metrics against the outline
+//! sim.save().await?;                      // write Zarr results
+//! ```
+
 use anyhow::{Result, bail};
 use compute_core::{
     ComputeOrchestrator, GpuCache, ParticleState, SimInfo, SimInfoFlags, TextureRgba, TimestepData,
     buffers::{AtomicValues, BufferName, CenterOfMassResult, TextureName},
     dem::{Bounds, Dem},
     post_processing::*,
-    settings::{Settings, SimModel, SimSettings},
+    settings::{CrownLineMethod, Settings, SimModel, SimSettings},
     utils::*,
 };
 #[cfg(target_arch = "wasm32")]
@@ -12,12 +49,19 @@ use data_processor::zarr_writer::{ResultGrids, ZarrEntry};
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::sync::Once;
 use web_time::Instant;
+
+/// Release-area and crown-line estimation from a DEM and avalanche outline.
+pub mod release_estimation;
 static INIT: Once = Once::new();
 #[allow(unused_imports)]
 use tracing::{debug, error, info, trace, warn};
 use tracing_subscriber::{EnvFilter, fmt, prelude::*};
 
-/// Initializes the global tracing subscriber.
+/// Initializes the global tracing subscriber; later calls are no-ops.
+///
+/// The filter is fixed per build profile: debug builds log
+/// `compute_core`/`simulation` at `trace` level, release builds only `info`
+/// and above (plus `error` from all other crates).
 pub fn init_logging() {
     INIT.call_once(|| {
         #[cfg(debug_assertions)]
@@ -37,52 +81,112 @@ pub fn init_logging() {
     });
 }
 
+/// Lifecycle of a [`Simulation`], ordered from creation to evaluation so that
+/// `state >= X` means "stage `X` and every stage before it have completed".
+///
+/// [`Simulation`] methods check this ordering and return an error when their
+/// prerequisites have not run yet.
 #[derive(Debug, Clone, Copy, PartialEq, PartialOrd)]
 pub enum SimulationState {
+    /// Freshly constructed; no settings or DEM loaded.
     Uninitialized,
+    /// Data applied, but the DEM is empty.
     DemMissing,
+    /// A DEM is loaded and ready for terrain analysis.
     DemLoaded,
+    /// Slope, aspect, curvature and related terrain metrics computed on the GPU.
     TerrainAnalyzed,
+    /// Release areas determined and the particle count fixed.
     ReleaseAreasComputed,
+    /// Particles seeded on the GPU; the simulation can be stepped.
     ParticlesInitialized,
+    /// At least one compute step has run; more steps can follow.
     Running,
+    /// Physics finished: `max_steps` reached or the GPU signalled `SIM_STOPPED`.
     Finished,
+    /// Peak grids thresholded and the avalanche mask extracted
+    /// ([`Simulation::post_process`]).
     PostProcessed,
+    /// Evaluation metrics computed against the region of interest
+    /// ([`Simulation::evaluate`]).
     Evaluated,
 }
 
+/// Data produced by [`Simulation::load_data`] and consumed by
+/// [`Simulation::apply_data`]; splitting the two lets callers load data
+/// concurrently with GPU initialization.
 pub struct SimulationLoadResult {
+    /// Simulation parameters resolved from the settings file and DEM.
     pub settings: SimSettings,
+    /// Whether to track the center of mass during the run.
+    pub enable_center_of_mass: bool,
+    /// Loaded digital elevation model.
     pub dem: Dem,
+    /// Region-of-interest (area that should be considered for release areas, e.g. avalanche outline) cell mask, `width * height` long.
     pub roi: Vec<bool>,
+    /// Path the DEM was loaded from; empty when unknown.
     pub dem_path: String,
+    /// Path of a release-area texture, if one was configured.
     pub release_areas_path: Option<String>,
+    /// Fraction of the outline area to fill with release mass via crown-line
+    /// estimation, if configured.
+    pub release_area_fraction: Option<f32>,
+    /// Method used to estimate the crown line when `release_area_fraction`
+    /// is set; `None` falls back to flow routing.
+    pub crown_line_method: Option<CrownLineMethod>,
+    /// Number of compute steps dispatched per GPU submission. The OS might reset the GPU or interrupt the submission, if computing a batch takes too long.
     pub batch_compute_steps: Option<u32>,
+    /// Destination for results written by [`Simulation::save`].
     pub output_path: Option<String>,
 }
 
+/// A single avalanche simulation: owns the GPU orchestrator, the loaded DEM,
+/// the pipeline [`SimulationState`] and a CPU-side cache of GPU readbacks.
+///
+/// Typical flow: construct with [`Simulation::new`], load data with one of the
+/// `create*` methods (or set a DEM directly with
+/// [`Simulation::set_dem_with_bounds`]), then [`Simulation::prepare`] and
+/// [`Simulation::run`]/[`Simulation::run_n_steps`]. Results are read back
+/// lazily by the `fetch_*` methods and memoized in [`Simulation::gpu_cache`]
+/// until the next pipeline stage invalidates them.
 pub struct Simulation {
     orchestrator: ComputeOrchestrator,
+    /// Physics and numerics parameters in effect for this run.
     pub settings: SimSettings,
     pub dem_path: String,
+    /// The digital elevation model the simulation runs on.
     pub dem: Dem,
+    /// Region-of-interest (avalanche outline) cell mask, one entry per cell.
     pub roi: Vec<bool>,
+    /// Destination of [`Simulation::save`] (Zarr store path or prefix).
     pub output_path: String,
     release_areas_path: Option<String>,
+    release_area_fraction: Option<f32>,
+    crown_line_method: CrownLineMethod,
     release_areas_array: Option<Vec<f32>>,
+    /// Crown line detected by release area estimation; empty unless
+    /// `release_area_fraction` was set.
+    pub crown_line: Vec<bool>,
     sim_info: SimInfo,
     number_particles: u32,
     state: SimulationState,
+    /// CPU-side memoization of GPU readbacks, invalidated automatically as
+    /// the simulation advances.
     pub gpu_cache: GpuCache,
+    /// Avalanche deposit mask extracted by [`Simulation::post_process`].
     pub ava_mask: Vec<bool>,
     #[cfg(not(target_arch = "wasm32"))]
     output: Option<data_processor::output::Output>,
 }
 
 impl Simulation {
+    /// Creates an empty simulation on the default GPU adapter.
     pub async fn new() -> Result<Self> {
         Self::new_with_gpu(None).await
     }
+    /// Creates an empty simulation, optionally pinning it to a GPU adapter by
+    /// name (see `compute_core::list_devices`); `None` uses the default
+    /// adapter.
     pub async fn new_with_gpu(gpu: Option<String>) -> Result<Self> {
         timer_new();
         let orchestrator = ComputeOrchestrator::new_with_gpu(gpu).await?;
@@ -98,13 +202,18 @@ impl Simulation {
             gpu_cache: GpuCache::default(),
             sim_info: SimInfo::default(),
             release_areas_path: None,
+            release_area_fraction: None,
+            crown_line_method: CrownLineMethod::FlowRouting,
             release_areas_array: None,
+            crown_line: Vec::new(),
             ava_mask: Vec::new(),
             #[cfg(not(target_arch = "wasm32"))]
             output: None,
         })
     }
 
+    /// Creates an empty simulation and loads the data described by `settings`
+    /// in parallel; equivalent to [`Self::new`] + [`Self::apply_data`].
     pub async fn new_with_settings(settings: Settings) -> Result<Self> {
         let (simulation, simulation_data) =
             futures::join!(Simulation::new(), Simulation::load_data(&settings),);
@@ -116,6 +225,7 @@ impl Simulation {
         Ok(simulation)
     }
 
+    /// Current position in the [`SimulationState`] lifecycle.
     pub fn get_state(&self) -> SimulationState {
         self.state
     }
@@ -124,6 +234,7 @@ impl Simulation {
     pub fn reset(&mut self) {
         self.gpu_cache.reset_all();
         self.sim_info = SimInfo::default();
+        self.crown_line = Vec::new();
         self.state = if self.dem.data1d.is_empty() {
             SimulationState::DemMissing
         } else {
@@ -137,10 +248,14 @@ impl Simulation {
         &self.orchestrator
     }
 
+    /// Number of particles seeded from the release areas; fixed by
+    /// [`Self::prepare`] (release cells × particles per cell).
     pub fn number_particles(&self) -> u32 {
         self.number_particles
     }
 
+    /// Stable hash of the release-area array; part of [`Self::scenario_name`]
+    /// so different release masks end up in different scenarios.
     pub fn release_hash(&self) -> u64 {
         let mut s = DefaultHasher::new();
         if let Some(release_areas_array) = &self.release_areas_array {
@@ -151,14 +266,21 @@ impl Simulation {
         s.finish()
     }
 
+    /// Number of GPU→CPU readbacks issued so far; exposed so tests can verify
+    /// that [`Self::gpu_cache`] actually avoids re-reads.
     pub fn get_gpu_cache_read_count(&self) -> usize {
         self.gpu_cache.read_count
     }
 
+    /// Elevation below which particles are considered to have left the DEM
+    /// (minimum DEM elevation minus a small margin).
     pub fn elevation_threshold(&self) -> f32 {
         self.sim_info.elevation_threshold
     }
 
+    /// Resolves a [`Settings`] descriptor into [`SimulationLoadResult`]
+    /// (settings, DEM, region of interest) without needing a simulation
+    /// instance; pair the result with [`Self::apply_data`].
     pub async fn load_data(settings: &Settings) -> Result<SimulationLoadResult> {
         timer_checkpoint("Start create");
         let (settings_result, dem_result, outline) =
@@ -173,10 +295,15 @@ impl Simulation {
             batch_compute_steps: settings.batch_compute_steps,
             dem_path: settings.dem_path.clone().unwrap_or_default(),
             release_areas_path: settings.release_areas_path.clone(),
+            release_area_fraction: settings.release_area_fraction,
+            crown_line_method: settings.crown_line_method,
             output_path: settings.output_path.clone(),
         })
     }
 
+    /// Installs previously loaded data and resets all GPU state; the
+    /// simulation ends in [`SimulationState::DemLoaded`], or
+    /// [`SimulationState::DemMissing`] when the DEM is empty.
     pub fn apply_data(&mut self, data: SimulationLoadResult) {
         self.settings = data.settings;
         if let Some(batch_steps) = data.batch_compute_steps {
@@ -194,6 +321,11 @@ impl Simulation {
             self.output = None;
         }
         self.release_areas_path = data.release_areas_path;
+        self.release_area_fraction = data.release_area_fraction;
+        self.crown_line_method = data
+            .crown_line_method
+            .unwrap_or(CrownLineMethod::FlowRouting);
+        self.crown_line = Vec::new();
 
         self.gpu_cache.reset_all();
 
@@ -211,12 +343,15 @@ impl Simulation {
         timer_checkpoint("Simulation updated/created");
     }
 
+    /// Loads and applies the data described by `settings`, replacing anything
+    /// currently loaded ([`Self::load_data`] + [`Self::apply_data`]).
     pub async fn create(&mut self, settings: Settings) -> Result<()> {
         let data = Self::load_data(&settings).await?;
         self.apply_data(data);
         Ok(())
     }
 
+    /// Creates the simulation from a DEM path with default settings.
     pub async fn create_default(&mut self, dem_path: &str) -> Result<()> {
         let settings = Settings {
             dem_path: Some(dem_path.to_string()),
@@ -226,6 +361,8 @@ impl Simulation {
         Ok(())
     }
 
+    /// Creates the simulation from a DEM and a release-area texture, with
+    /// default settings otherwise.
     pub async fn create_default_with_release_areas(
         &mut self,
         dem_path: &str,
@@ -240,6 +377,9 @@ impl Simulation {
         Ok(())
     }
 
+    /// Creates the simulation from a `.png` DEM, deriving the release texture
+    /// path from it by the example naming convention
+    /// (`avaFoo.png` → `avaFooreleaseTexture.png`).
     pub async fn create_example(&mut self, dem_path: &str) -> Result<()> {
         let release_areas_path = dem_path.to_string().replace(".png", "releaseTexture.png");
         let settings = Settings {
@@ -251,6 +391,8 @@ impl Simulation {
         Ok(())
     }
 
+    /// Sets the DEM from raw cell data with bounds starting at the origin and
+    /// unit map factor; identical to [`Self::set_dem`].
     pub fn set_dem_default(
         &mut self,
         dem_data: &[f32],
@@ -271,6 +413,8 @@ impl Simulation {
         )
     }
 
+    /// Sets the DEM from `width * height` row-major elevations with square
+    /// `cell_size` cells and bounds starting at the coordinate origin.
     pub fn set_dem(
         &mut self,
         dem_data: &[f32],
@@ -313,6 +457,13 @@ impl Simulation {
         )
     }
 
+    /// Sets the DEM from raw data with full georeferencing: row-major
+    /// `width * height` elevations, square `cell_size`, world-space bounds
+    /// and `map_factor` scaling. Also derives minimum elevation and coordinate
+    /// axes, and syncs [`Self::settings`] to the new grid.
+    ///
+    /// Errors if the data length does not match the dimensions, or if cell
+    /// size, map factor or bounds are non-finite or degenerate.
     #[allow(clippy::too_many_arguments)]
     pub fn set_dem_with_bounds(
         &mut self,
@@ -398,6 +549,9 @@ impl Simulation {
         Ok(())
     }
 
+    /// Sets the per-cell release thickness directly, overriding any configured
+    /// release-area path. The length must match the DEM, so the DEM has to be
+    /// set first.
     pub fn set_release_areas(&mut self, release_areas: &[f32]) -> Result<()> {
         if release_areas.len() != self.dem.width * self.dem.height {
             bail!(
@@ -413,6 +567,31 @@ impl Simulation {
         Ok(())
     }
 
+    /// Sets the region of interest (avalanche outline) as a cell mask. Must
+    /// match the DEM dimensions; cells outside the mask never become release
+    /// area or deposit.
+    pub fn set_roi(&mut self, roi: &[bool]) -> Result<()> {
+        let expected_len = self
+            .dem
+            .width
+            .checked_mul(self.dem.height)
+            .ok_or_else(|| anyhow::anyhow!("DEM dimensions overflow usize"))?;
+        if roi.len() != expected_len {
+            bail!(
+                "ROI length ({}) does not match DEM dimensions ({}x{}={}). You have to set the DEM first.",
+                roi.len(),
+                self.dem.width,
+                self.dem.height,
+                expected_len
+            );
+        }
+        self.roi = roi.to_vec();
+        Ok(())
+    }
+
+    /// Runs the pre-simulation stages in order: terrain analysis, release-area
+    /// determination (see `load_release_areas` for the source priority) and
+    /// particle initialization.
     pub async fn prepare(&mut self) -> Result<()> {
         self.analyze_terrain().await?;
         let _ = self.load_release_areas().await?;
@@ -420,6 +599,13 @@ impl Simulation {
         Ok(())
     }
 
+    /// Advances the simulation by up to `steps` steps, automatically running
+    /// [`Self::prepare`] and setting up the GPU pipeline for the configured
+    /// [`SimModel`] on first call. Returns the updated [`SimInfo`].
+    ///
+    /// The request is clamped to the remaining budget up to `max_steps`;
+    /// reaching it (or the GPU signalling `SIM_STOPPED`) moves the state to
+    /// [`SimulationState::Finished`], after which calls become no-ops.
     pub async fn run_n_steps(&mut self, steps: u32) -> Result<SimInfo> {
         if self.state >= SimulationState::Finished {
             return Ok(self.sim_info);
@@ -489,6 +675,11 @@ impl Simulation {
         Ok(self.sim_info)
     }
 
+    /// Runs the whole pipeline to completion in one call: terrain analysis,
+    /// release areas, particle initialization and the full simulation, ending
+    /// in [`SimulationState::Finished`].
+    ///
+    /// Fails when the release areas contain no cells (nothing to simulate).
     pub async fn run(&mut self) -> Result<()> {
         self.analyze_terrain().await?;
         timer_checkpoint("Terrain analyzed");
@@ -510,6 +701,11 @@ impl Simulation {
         Ok(())
     }
 
+    /// Extracts the avalanche mask from the results: the peak flow thickness
+    /// is thresholded (`peak_flow_thickness_threshold` setting) and reduced to
+    /// its biggest connected blob, becoming [`Self::ava_mask`]; peak velocity
+    /// is masked to the same region. Requires
+    /// [`SimulationState::Finished`].
     pub async fn post_process(&mut self) -> Result<()> {
         if self.state < SimulationState::Finished {
             bail!("Simulation must be finished before post-processing results");
@@ -532,6 +728,16 @@ impl Simulation {
         Ok(())
     }
 
+    /// Compares the simulated avalanche against the region of interest and
+    /// moves the state to [`SimulationState::Evaluated`]. Requires
+    /// [`SimulationState::PostProcessed`].
+    ///
+    /// Returns `(iou, horizontal_distance, vertical_drop,
+    /// horizontal_distance_ref, vertical_drop_ref, beeline_3d, beeline_3d_ref,
+    /// peak_velocity)`: the Jaccard index of mask vs. outline, the runout
+    /// horizontal distance and vertical drop of simulation and reference
+    /// outline, the corresponding 3D beeline lengths, and the maximum peak
+    /// velocity.
     pub async fn evaluate(&mut self) -> Result<(f32, f32, f32, f32, f32, f32, f32, f32)> {
         if self.state < SimulationState::PostProcessed {
             bail!("Simulation must be post-processed before evaluation");
@@ -564,6 +770,16 @@ impl Simulation {
         ))
     }
 
+    /// Runs the GPU evaluation metrics: mass movement counts (alpha/beta/gamma/
+    /// jaccard), the diagonal-normalized chamfer distance against the region of
+    /// interest and the 3D beeline distance between the highest and lowest
+    /// avalanche point.
+    pub async fn evaluate_gpu(&mut self) -> Result<MassMovementEvaluation> {
+        self.orchestrator.evaluate_gpu(&self.settings).await
+    }
+
+    /// Native only: writes the results to the Zarr store at `path`, switching
+    /// away from [`Self::output_path`] if it differs.
     #[cfg(not(target_arch = "wasm32"))]
     pub async fn save_with_path(&mut self, path: &str) -> Result<()> {
         if self.output_path != path {
@@ -652,6 +868,12 @@ impl Simulation {
         ))
     }
 
+    /// Native only: appends this run to the Zarr store at
+    /// [`Self::output_path`], creating the site (derived from the DEM, see
+    /// [`Self::site_name`]) and scenario (derived from the release areas, see
+    /// [`Self::scenario_name`]) entries as needed. Each run stores peak
+    /// velocity, peak flow thickness, release volume and the center-of-mass
+    /// trajectory.
     #[cfg(not(target_arch = "wasm32"))]
     pub async fn save(&mut self) -> Result<()> {
         let mut site_name = std::path::Path::new(&self.dem_path)
@@ -728,6 +950,8 @@ impl Simulation {
         Ok(())
     }
 
+    /// Reads the run info (timestep, dt, stop flags, ...) from the GPU and
+    /// stores it in `self.sim_info`.
     pub async fn fetch_sim_info(&mut self) -> Result<SimInfo> {
         self.sim_info = self
             .orchestrator
@@ -739,6 +963,7 @@ impl Simulation {
         Ok(self.sim_info)
     }
 
+    /// Reads the GPU atomic counters.
     pub async fn fetch_atomic_values(&mut self) -> Result<AtomicValues> {
         let atomic_values = self
             .orchestrator
@@ -750,6 +975,8 @@ impl Simulation {
         Ok(atomic_values)
     }
 
+    /// Runs the terrain analysis shaders (slope, aspect, curvature, terrain
+    /// geometry) and invalidates the whole result cache.
     async fn analyze_terrain(&mut self) -> Result<()> {
         if self.state < SimulationState::DemLoaded {
             bail!("DEM and settings must be loaded before running normals shader");
@@ -762,6 +989,132 @@ impl Simulation {
         Ok(())
     }
 
+    /// Detects the crown line by running a GPU particle simulation on a copy
+    /// of the DEM where the outline is masked out with NaN: particles are
+    /// released everywhere outside the outline (minus a one-cell ring, whose
+    /// spawn jitter could seed particles inside the mask), slide downslope
+    /// with the plain particle model (no curvature, particle interaction,
+    /// earth pressure or entrainment) and stop with `out_of_dem_data` set
+    /// where the bilinear terrain sampling first blends in the masked cells -
+    /// at the latest on the boundary itself. Each stopped particle is
+    /// attributed to the outline cell its velocity points into; outline cells
+    /// entered by at least `config.min_particles_per_crown_cell` particles
+    /// become crown candidates, and candidate components are then filtered
+    /// exactly like in the flow-routing method.
+    ///
+    /// Compared to D8 flow routing, the particles add inertia, so terrain that
+    /// only reaches the outline with momentum (through a flat approach or a
+    /// counter-slope shoulder) is still detected.
+    async fn detect_crown_line_by_particle_simulation(
+        &self,
+        config: &release_estimation::ReleaseEstimationConfig,
+    ) -> Result<release_estimation::CrownDetection> {
+        /// Particles per release cell for the detection simulation. Four
+        /// entries per crown cell on planar inflow keep the entry counts well
+        /// above the threshold while keeping the total particle count
+        /// manageable on large tiles.
+        const DETECTION_PARTICLES_PER_CELL: u32 = 4;
+
+        // Mask the outline out of the DEM and release everything except a
+        // one-cell ring around the outline: a particle crossing into the
+        // outline samples a NaN normal, is flagged out_of_dem_data and stops
+        // on that cell. The ring stays unreleased because particles spawn
+        // with +-0.5 cell jitter - ring cells would seed particles inside the
+        // masked outline, where they would count as entries without ever
+        // flowing in.
+        let number_cells = self.dem.width.saturating_mul(self.dem.height);
+        let mut masked_dem = self.dem.data1d.clone();
+        let mut detection_release = vec![0.0f32; number_cells];
+        for idx in 0..number_cells {
+            if self.roi[idx] {
+                masked_dem[idx] = f32::NAN;
+                continue;
+            }
+            let adjacent_to_outline = release_estimation::any_neighbor_is(
+                idx,
+                self.dem.width,
+                self.dem.height,
+                &self.roi,
+            );
+            if !adjacent_to_outline {
+                detection_release[idx] = 1.0;
+            }
+        }
+
+        let mut settings = Settings::default();
+        settings.sim_model = Some(SimModel::TerrainFollowing);
+        settings.max_steps = Some(self.settings.max_steps);
+        settings.released_particles_per_cell = Some(DETECTION_PARTICLES_PER_CELL);
+        settings.enable_curvature = Some(false);
+        settings.enable_particle_interaction = Some(false);
+        settings.enable_earth_pressure_coefficient = Some(false);
+        settings.enable_entrainment = Some(false);
+
+        let mut detection_sim = Simulation::new().await?;
+        detection_sim.create(settings).await?;
+        detection_sim.set_dem(
+            &masked_dem,
+            self.dem.width,
+            self.dem.height,
+            self.dem.cell_size,
+        )?;
+        detection_sim.set_roi(&vec![true; masked_dem.len()])?;
+        detection_sim.set_release_areas(&detection_release)?;
+        detection_sim.run().await?;
+
+        let sim_info = detection_sim.fetch_sim_info().await?;
+        if !sim_info
+            .parsed_flags()
+            .contains(SimInfoFlags::ALL_PARTICLES_STOPPED)
+        {
+            warn!(
+                "crown detection simulation stopped at max_steps; entry counts may be incomplete"
+            );
+        }
+
+        let positions = detection_sim.fetch_particles_position().await?.clone();
+        let velocities = detection_sim.fetch_particles_velocity().await?.clone();
+        let states = detection_sim.fetch_particles_state().await?.clone();
+        let mut counts = vec![0u32; number_cells];
+        let mut entered = 0usize;
+        for ((state, position), velocity) in
+            states.iter().zip(positions.iter()).zip(velocities.iter())
+        {
+            if !state.out_of_dem_data {
+                continue;
+            }
+            if let Some(idx) = release_estimation::entry_cell(
+                *position,
+                *velocity,
+                &self.roi,
+                self.dem.width,
+                self.dem.height,
+                self.dem.cell_size,
+            ) {
+                counts[idx] += 1;
+                entered += 1;
+            }
+        }
+        if entered == 0 {
+            bail!("crown detection simulation: no particles reached the outline");
+        }
+        info!(
+            "crown detection simulation: {entered} of {} particles entered the outline",
+            positions.len()
+        );
+
+        release_estimation::crown_line_from_particle_counts(&counts, &self.dem, &self.roi, config)
+    }
+
+    /// Determines the release areas and returns the number of release cells.
+    ///
+    /// Sources are tried in priority order: a release-area file
+    /// (`release_areas_path`), a directly set array
+    /// ([`Self::set_release_areas`]), crown-line estimation from the outline
+    /// (`release_area_fraction`, also fills [`Self::crown_line`]), and finally
+    /// automatic computation from roughness and slope thresholds on the GPU.
+    /// Fixes [`Self::number_particles`] and moves the state to
+    /// [`SimulationState::ReleaseAreasComputed`].
     async fn load_release_areas(&mut self) -> Result<u32> {
         if self.state < SimulationState::TerrainAnalyzed {
             bail!("Terrain must be analyzed before loading release areas");
@@ -793,15 +1146,53 @@ impl Simulation {
                         .await?;
                     data.iter().filter(|&&x| x > 1e-3).count() as u32
                 }
-                None => {
-                    info!("Computing release areas from DEM");
-                    self.orchestrator
-                        .run_compute_roughness(&self.settings)
-                        .await?;
-                    self.orchestrator
-                        .run_compute_release_areas(&self.settings, &self.roi)
-                        .await?
-                }
+                None => match self.release_area_fraction {
+                    Some(fraction) => {
+                        info!(
+                            "Estimating release areas from crown line (fraction {fraction:.2}, method {})",
+                            self.crown_line_method
+                        );
+                        let config = release_estimation::ReleaseEstimationConfig {
+                            fraction,
+                            slab_thickness: self.settings.slab_thickness_factor,
+                            expected_crown_slope_range: (
+                                self.settings.min_slope_angle,
+                                self.settings.max_slope_angle,
+                            ),
+                            ..Default::default()
+                        };
+                        let detection = match self.crown_line_method {
+                            CrownLineMethod::FlowRouting => release_estimation::detect_crown_line(
+                                &self.dem, &self.roi, &config,
+                            )?,
+                            CrownLineMethod::ParticleSimulation => {
+                                // Box::pin breaks the future type recursion:
+                                // run() -> load_release_areas() -> here -> run()
+                                // (the nested simulation is a separate instance,
+                                // so the indirection is purely a type-level fix)
+                                Box::pin(self.detect_crown_line_by_particle_simulation(&config))
+                                    .await?
+                            }
+                        };
+                        let estimate = release_estimation::estimate_release_areas_with_crown(
+                            &self.dem, &self.roi, &detection, &config,
+                        )?;
+                        self.crown_line = estimate.crown_line;
+                        self.orchestrator
+                            .write_buffer(BufferName::ReleaseAreas, &estimate.release_areas)
+                            .await?;
+                        estimate.number_release_cells as u32
+                    }
+                    None => {
+                        info!("Computing release areas from DEM");
+                        self.orchestrator
+                            .run_compute_roughness(&self.settings)
+                            .await?;
+                        self.orchestrator
+                            .run_compute_release_areas(&self.settings, &self.roi)
+                            .await?
+                    }
+                },
             },
         };
         self.number_particles = checked_particle_count(
@@ -836,6 +1227,8 @@ impl Simulation {
         Ok(())
     }
 
+    /// Seeds the particles inside the release areas on the GPU; requires the
+    /// release areas to be computed and at least one release cell.
     async fn initialize_particles(&mut self) -> Result<()> {
         if self.state < SimulationState::ReleaseAreasComputed {
             bail!("Release areas must be computed before initializing particles");
@@ -885,6 +1278,7 @@ impl Simulation {
         ))
     }
 
+    /// Per-cell terrain roughness from terrain analysis.
     pub async fn fetch_roughness(&mut self) -> Result<&Vec<f32>> {
         if self.state < SimulationState::ReleaseAreasComputed {
             bail!("Release areas must be computed before reading roughness texture");
@@ -897,6 +1291,8 @@ impl Simulation {
         Ok(self.gpu_cache.roughness.as_ref().unwrap())
     }
 
+    /// Per-cell maximum flow thickness over the whole run; requires
+    /// [`SimulationState::Finished`].
     pub async fn fetch_peak_flow_thickness(&mut self) -> Result<&[f32]> {
         if self.state < SimulationState::Finished {
             bail!("Simulation must be finished before reading peak flow thickness buffer");
@@ -912,6 +1308,7 @@ impl Simulation {
         Ok(self.gpu_cache.peak_flow_thickness.as_deref().unwrap())
     }
 
+    /// Per-cell slope angle in degrees from terrain analysis.
     pub async fn fetch_slope_angle(&mut self) -> Result<&[f32]> {
         if self.state < SimulationState::TerrainAnalyzed {
             bail!("Terrain metrics must be computed before reading slope texture");
@@ -927,6 +1324,7 @@ impl Simulation {
         Ok(self.gpu_cache.slope_angle.as_deref().unwrap())
     }
 
+    /// Per-cell slope aspect in degrees from terrain analysis.
     pub async fn fetch_slope_aspect(&mut self) -> Result<&[f32]> {
         if self.state < SimulationState::TerrainAnalyzed {
             bail!("Terrain metrics must be computed before reading slope aspect texture");
@@ -942,6 +1340,9 @@ impl Simulation {
         Ok(self.gpu_cache.slope_aspect.as_deref().unwrap())
     }
 
+    /// Terrain geometry texture: surface normals (curvilinear metric terms
+    /// `l_x`, `l_y`, Jacobian) in RGB and the projected gravity y component
+    /// in A.
     async fn fetch_terrain_geometry_texture(&mut self) -> Result<&TextureRgba<f32>> {
         if self.state < SimulationState::TerrainAnalyzed {
             bail!("Terrain geometry must be computed before reading terrain geometry texture");
@@ -953,6 +1354,8 @@ impl Simulation {
         }
         Ok(self.gpu_cache.terrain_geometry.as_ref().unwrap())
     }
+    /// Curvature texture: `k_xx` in R, `k_yy` in G, `k_xy` in B and the
+    /// projected gravity x component in A.
     pub async fn fetch_terrain_curvature(&mut self) -> Result<&TextureRgba<f32>> {
         if self.state < SimulationState::TerrainAnalyzed {
             bail!("Terrain curvature must be computed before reading terrain curvature texture");
@@ -964,12 +1367,14 @@ impl Simulation {
         Ok(self.gpu_cache.curvature.as_ref().unwrap())
     }
 
+    /// Slope-projected gravity components `(g_x, g_y)` per cell for curvilinear models.
     pub async fn get_slope_gravity(&mut self) -> Result<(Vec<f32>, Vec<f32>)> {
         let g_x = self.fetch_terrain_curvature().await?.a.clone();
         let g_y = self.fetch_terrain_geometry_texture().await?.a.clone();
         Ok((g_x, g_y))
     }
 
+    /// Terrain curvature components `(k_xx, k_yy, k_xy)` per cell.
     pub async fn get_curvature(&mut self) -> Result<(Vec<f32>, Vec<f32>, Vec<f32>)> {
         let k_x = self.fetch_terrain_curvature().await?.r.clone();
         let k_y = self.fetch_terrain_curvature().await?.g.clone();
@@ -977,18 +1382,27 @@ impl Simulation {
         Ok((k_x, k_y, k_xy))
     }
 
+    /// First channel of the terrain geometry texture: surface normal x
+    /// component (curvilinear metric term `l_x`).
     pub async fn get_terrain_geometry_x(&mut self) -> Result<Vec<f32>> {
         Ok(self.fetch_terrain_geometry_texture().await?.r.clone())
     }
 
+    /// Second channel of the terrain geometry texture: surface normal y
+    /// component (curvilinear metric term `l_y`).
     pub async fn get_terrain_geometry_y(&mut self) -> Result<Vec<f32>> {
         Ok(self.fetch_terrain_geometry_texture().await?.g.clone())
     }
 
+    /// Third channel of the terrain geometry texture: surface normal z
+    /// component (curvilinear Jacobian).
     pub async fn get_terrain_geometry_z(&mut self) -> Result<Vec<f32>> {
         Ok(self.fetch_terrain_geometry_texture().await?.b.clone())
     }
 
+    /// Per-cell release thickness in effect for this run (loaded from file,
+    /// set directly, estimated or computed); requires
+    /// [`SimulationState::ReleaseAreasComputed`].
     pub async fn fetch_release_areas(&mut self) -> Result<&[f32]> {
         if self.state < SimulationState::ReleaseAreasComputed {
             bail!("Release areas must be computed before reading release areas texture");
@@ -1004,6 +1418,8 @@ impl Simulation {
         Ok(self.gpu_cache.release_areas.as_deref().unwrap())
     }
 
+    /// Per-cell maximum flow velocity over the whole run; requires
+    /// [`SimulationState::Finished`].
     pub async fn fetch_peak_velocity(&mut self) -> Result<&Vec<f32>> {
         if self.state < SimulationState::Finished {
             bail!("Simulation must be finished before reading peak velocity");
@@ -1019,6 +1435,9 @@ impl Simulation {
         Ok(self.gpu_cache.peak_velocity.as_ref().unwrap())
     }
 
+    /// Per-step trajectory record of a randomly tracked particle.
+    /// velocity, position, dt, uv, travel distances and CFL numbers, one
+    /// entry per completed step. Requires [`SimulationState::Finished`].
     pub async fn fetch_timestep_data(&mut self) -> Result<&TimestepData> {
         if self.state < SimulationState::Finished {
             bail!("Simulation must run and be finished before reading timestep data");
@@ -1041,6 +1460,7 @@ impl Simulation {
         Ok(self.gpu_cache.timestep_data.as_ref().unwrap())
     }
 
+    /// Particle xy positions, flattened as `[x0, y0, x1, y1, ...]`.
     pub async fn fetch_particles_position(&mut self) -> Result<&Vec<[f32; 2]>> {
         if self.state < SimulationState::ParticlesInitialized {
             bail!("Simulation must be initialized before reading particles");
@@ -1056,6 +1476,7 @@ impl Simulation {
         Ok(self.gpu_cache.particles_position.as_ref().unwrap())
     }
 
+    /// Particle xy velocities, flattened as `[vx0, vy0, vx1, vy1, ...]`.
     pub async fn fetch_particles_velocity(&mut self) -> Result<&Vec<[f32; 2]>> {
         if self.state < SimulationState::ParticlesInitialized {
             bail!("Simulation must be initialized before reading particles");
@@ -1071,6 +1492,8 @@ impl Simulation {
         Ok(self.gpu_cache.particles_velocity.as_ref().unwrap())
     }
 
+    /// Particle vertical velocities; identically zero for the MPM model,
+    /// which does not track a separate vertical component.
     pub async fn fetch_particles_velocity_z(&mut self) -> Result<&Vec<f32>> {
         if self.state < SimulationState::ParticlesInitialized {
             bail!("Simulation must be initialized before reading particles");
@@ -1091,6 +1514,7 @@ impl Simulation {
         Ok(self.gpu_cache.particles_velocity_z.as_ref().unwrap())
     }
 
+    /// Per-particle mass.
     pub async fn fetch_particles_mass(&mut self) -> Result<&Vec<f32>> {
         if self.state < SimulationState::ParticlesInitialized {
             bail!("Simulation must be initialized before reading particles");
@@ -1106,6 +1530,7 @@ impl Simulation {
         Ok(self.gpu_cache.particles_mass.as_ref().unwrap())
     }
 
+    /// Per-particle elevation values.
     pub async fn fetch_particles_elevation(&mut self) -> Result<&Vec<f32>> {
         if self.state < SimulationState::ParticlesInitialized {
             bail!("Simulation must be initialized before reading particles");
@@ -1121,6 +1546,8 @@ impl Simulation {
         Ok(self.gpu_cache.particles_elevation.as_ref().unwrap())
     }
 
+    /// Decoded per-particle [`ParticleState`] (moving/stopped flags and the
+    /// timestep at which each particle stopped).
     pub async fn fetch_particles_state(&mut self) -> Result<&Vec<ParticleState>> {
         if self.state < SimulationState::ParticlesInitialized {
             bail!("Simulation must be initialized before reading particles");
@@ -1137,6 +1564,8 @@ impl Simulation {
         Ok(self.gpu_cache.particles_stopped.as_ref().unwrap())
     }
 
+    /// Convenience: fetches position, velocity, mass, elevation and state in
+    /// one go.
     pub async fn fetch_particles_all(&mut self) -> Result<()> {
         self.fetch_particles_position().await?;
         self.fetch_particles_velocity().await?;
@@ -1146,9 +1575,11 @@ impl Simulation {
         Ok(())
     }
 
+    /// Raw center-of-mass record per step (`com_x`, `com_y`, elevation, total
+    /// mass); requires simulation to be finished.
     pub async fn fetch_center_of_mass(&mut self) -> Result<&Vec<CenterOfMassResult>> {
-        if self.state < SimulationState::ParticlesInitialized {
-            bail!("Simulation must be initialized before reading particles");
+        if self.state < SimulationState::Finished {
+            bail!("Simulation must be finished before reading center of mass");
         }
         if self.gpu_cache.center_of_mass.is_none() {
             self.gpu_cache.read_count += 1;
@@ -1161,6 +1592,8 @@ impl Simulation {
         Ok(self.gpu_cache.center_of_mass.as_ref().unwrap())
     }
 
+    /// `(x, y, elevation)` vectors derived from [`Self::fetch_center_of_mass`],
+    /// with non-finite records filtered out.
     pub async fn get_center_of_mass(&mut self) -> Result<(Vec<f32>, Vec<f32>, Vec<f32>)> {
         let center_of_mass = self.fetch_center_of_mass().await?;
         let mut x: Vec<f32> = Vec::with_capacity(center_of_mass.len());
@@ -1179,16 +1612,21 @@ impl Simulation {
         Ok((x, y, z))
     }
 
+    /// Sum of all particle masses.
     pub async fn get_total_mass(&mut self) -> Result<f32> {
         let particles_mass = self.fetch_particles_mass().await?;
         let mass_total: f32 = particles_mass.iter().sum();
         Ok(mass_total)
     }
 
+    /// Total released volume, obtained from [`Self::get_total_mass`] via the
+    /// configured snow density.
     pub async fn get_total_volume(&mut self) -> Result<f32> {
         Ok(self.get_total_mass().await? / self.settings.density)
     }
 
+    /// Raw debug from debug buffer.
+    /// requires [`SimulationState::Finished`].
     pub async fn get_compute_particles_debug(&self) -> Result<Vec<f32>> {
         if self.state < SimulationState::Finished {
             bail!("Simulation must be finished before reading cell count grid");
@@ -1196,7 +1634,8 @@ impl Simulation {
         self.orchestrator.read_buffer(BufferName::Debug).await
     }
 
-    /// This function can be used to pre-load all results into the cache, so that subsequent calls to getters will be fast
+    /// Pre-loads all results into [`Self::gpu_cache`] so that subsequent
+    /// `fetch_*` calls are served from memory.
     pub async fn fetch_results(&mut self) -> Result<()> {
         let start = Instant::now();
         self.fetch_peak_flow_thickness().await?;
@@ -1217,6 +1656,9 @@ impl Simulation {
         Ok(())
     }
 
+    /// Prints a `width * height` grid as ASCII art to stdout, box-averaged
+    /// down to at most `max_w` × `max_h` characters. Values are clamped to
+    /// `[0, 1]` and mapped onto a ` .:-=+*#%@` brightness ramp.
     pub fn print_grid(&self, grid: &[f32], max_w: usize, max_h: usize) -> Result<()> {
         if max_w == 0 || max_h == 0 {
             bail!("Maximum grid width and height must be greater than zero");
@@ -1273,12 +1715,16 @@ impl Simulation {
     }
 }
 
+/// Release cells times particles per cell, erroring on `u32` overflow.
 fn checked_particle_count(release_cells: u32, particles_per_cell: u32) -> Result<u32> {
     release_cells
         .checked_mul(particles_per_cell)
         .ok_or_else(|| anyhow::anyhow!("Particle count exceeds u32 capacity"))
 }
 
+/// Converts center-of-mass records into absolute world coordinates (adding
+/// the DEM origin) and derives the total travel length and average travel
+/// angle in degrees.
 fn trajectory_summary(
     center_of_mass: &[CenterOfMassResult],
     origin_x: f32,
@@ -1790,6 +2236,97 @@ mod tests {
         let mut sim: Simulation = block_on(Simulation::new()).expect("Failed to create Simulation");
         block_on(sim.create_default(GAR_PATH)).expect("Failed to create simulation");
         block_on(sim.prepare()).expect("Failed to prepare simulation");
+    }
+
+    #[test_log::test]
+    fn test_release_estimation_crown_line_end_to_end() {
+        let width = 24;
+        let height = 24;
+        let cell_size = 5.0;
+        // inclined plane draining towards decreasing y
+        let dem_data: Vec<f32> = (0..width * height)
+            .map(|idx| 100.0 + (idx / width) as f32 * 5.0)
+            .collect();
+        let mut sim: Simulation = block_on(Simulation::new()).expect("Failed to create Simulation");
+        block_on(sim.create(Settings::default())).expect("Failed to create simulation");
+        sim.set_dem(&dem_data, width, height, cell_size)
+            .expect("Failed to set DEM");
+        // outline rectangle, upstream edge at y = 19
+        let roi: Vec<bool> = (0..width * height)
+            .map(|idx| {
+                let (x, y) = (idx % width, idx / width);
+                (4..20).contains(&x) && (4..20).contains(&y)
+            })
+            .collect();
+        sim.set_roi(&roi).expect("Failed to set ROI");
+        sim.release_area_fraction = Some(0.25);
+
+        block_on(sim.run()).expect("Failed to run simulation");
+        assert_eq!(sim.state, SimulationState::Finished);
+
+        // 256 outline cells -> 25% -> 64 release cells on the upstream rows
+        assert_eq!(sim.number_particles(), 64 * 8);
+        assert_eq!(sim.crown_line.iter().filter(|&&c| c).count(), 16);
+        let release_areas =
+            block_on(sim.fetch_release_areas()).expect("Failed to fetch release areas");
+        assert_eq!(release_areas.iter().filter(|&&t| t > 0.0).count(), 64);
+        for (idx, &inside) in roi.iter().enumerate() {
+            if !inside {
+                assert_eq!(release_areas[idx], 0.0, "release outside outline at {idx}");
+            }
+        }
+    }
+
+    #[test_log::test]
+    fn test_release_estimation_particle_crown_line_end_to_end() {
+        let width = 24;
+        let height = 24;
+        let cell_size = 5.0;
+        // inclined plane draining towards decreasing y
+        let dem_data: Vec<f32> = (0..width * height)
+            .map(|idx| 100.0 + (idx / width) as f32 * 5.0)
+            .collect();
+        let mut sim: Simulation = block_on(Simulation::new()).expect("Failed to create Simulation");
+        block_on(sim.create(Settings::default())).expect("Failed to create simulation");
+        sim.set_dem(&dem_data, width, height, cell_size)
+            .expect("Failed to set DEM");
+        let roi: Vec<bool> = (0..width * height)
+            .map(|idx| {
+                let (x, y) = (idx % width, idx / width);
+                (4..20).contains(&x) && (4..20).contains(&y)
+            })
+            .collect();
+        sim.set_roi(&roi).expect("Failed to set ROI");
+        sim.release_area_fraction = Some(0.25);
+        sim.crown_line_method = CrownLineMethod::ParticleSimulation;
+
+        block_on(sim.run()).expect("Failed to run simulation");
+        assert_eq!(sim.state, SimulationState::Finished);
+
+        // the crown line is the upstream row y = 19
+        let mut crown_cells = 0;
+        for (idx, &is_crown) in sim.crown_line.iter().enumerate() {
+            if is_crown {
+                let (x, y) = (idx % width, idx / width);
+                assert_eq!(y, 19, "crown cell outside the upstream row at x={x}");
+                crown_cells += 1;
+            }
+        }
+        assert!(
+            crown_cells >= 12,
+            "only {crown_cells} crown cells detected, expected most of row 19"
+        );
+
+        // fill below the crown line is unchanged by the detection method
+        assert_eq!(sim.number_particles(), 64 * 8);
+        let release_areas =
+            block_on(sim.fetch_release_areas()).expect("Failed to fetch release areas");
+        assert_eq!(release_areas.iter().filter(|&&t| t > 0.0).count(), 64);
+        for (idx, &inside) in roi.iter().enumerate() {
+            if !inside {
+                assert_eq!(release_areas[idx], 0.0, "release outside outline at {idx}");
+            }
+        }
     }
 
     fn create_slope(ncols: usize, nrows: usize, cellsize: f32, slope_degrees: f32) -> Vec<f32> {

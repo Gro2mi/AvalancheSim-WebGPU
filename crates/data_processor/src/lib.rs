@@ -1119,6 +1119,10 @@ mod tests {
             enable_entrainment: Some(true),
             enable_particle_interaction: Some(true),
             enable_earth_pressure_coefficient: Some(true),
+            enable_center_of_mass: Some(true),
+            center_of_mass_biggest_blob: Some(true),
+            release_area_fraction: None,
+            crown_line_method: None,
         };
         let file = NamedTempFile::new().unwrap();
         let path = file.path().to_str().unwrap();
